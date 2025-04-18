@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>EditShot - Smart Image Text Editor</title>
+  <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;700&display=swap" rel="stylesheet">
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body {
+      font-family: 'Montserrat', sans-serif;
+    }
+    .bg-hero {
+      background-image: url('https://images.unsplash.com/photo-1743653537429-a94889a6fd47?q=80&w=3272&auto=format&fit=crop&ixlib=rb-4.0.3&ixid=M3wxMjA3fDB8MHxwaG90by1wYWdlfHx8fGVufDB8fHx8fA%3D%3D');
+      background-size: cover;
+      background-position: center;
+    }
+    .glass {
+      background: rgba(255, 255, 255, 0.1);
+      backdrop-filter: blur(10px);
+    }
+  </style>
+</head>
+
+<body class="bg-gray-100 text-gray-900">
+  <!-- Hero Section -->
+  <section class="bg-hero h-screen flex flex-col justify-center items-center text-white text-center">
+    <div class="glass p-10 rounded-2xl shadow-xl">
+      <h1 class="text-5xl font-bold mb-4 animate-pulse">EditShot</h1>
+      <p class="text-xl mb-6">AI-powered Image Text Editor - Edit anything, your way</p>
+      <a href="#features" class="bg-white text-black px-6 py-3 rounded-full font-bold shadow-lg hover:bg-gray-200 transition-all duration-300">Explore Features</a>
+    </div>
+  </section>
+
+  <!-- Features Section -->
+  <section id="features" class="py-20 px-6 md:px-20 bg-white">
+    <h2 class="text-4xl font-bold text-center mb-16">Core Features</h2>
+    <div class="grid grid-cols-1 md:grid-cols-3 gap-10">
+      <div class="bg-gray-50 p-6 rounded-xl shadow-xl hover:scale-105 transition-transform duration-300">
+        <img src="https://plus.unsplash.com/premium_photo-1661284828052-ea25d6ea94cd?q=80&w=600&auto=format&fit=crop&ixlib=rb-4.0.3&ixid=M3wxMjA3fDB8MHxwaG90by1wYWdlfHx8fGVufDB8fHx8fA%3D%3D" alt="Text Recognition" class="rounded-lg mb-4">
+        <h3 class="text-2xl font-bold mb-2">Smart Text Detection</h3>
+        <p>Automatically recognize and extract text from any image with high precision.</p>
+      </div>
+      <div class="bg-gray-50 p-6 rounded-xl shadow-xl hover:scale-105 transition-transform duration-300">
+        <img src="https://images.unsplash.com/photo-1522202176988-66273c2fd55f?auto=format&fit=crop&w=600&q=80" alt="Font Styles" class="rounded-lg mb-4">
+        <h3 class="text-2xl font-bold mb-2">Diverse Fonts & Styles</h3>
+        <p>Choose from a wide range of fonts and styles for any creative need.</p>
+      </div>
+      <div class="bg-gray-50 p-6 rounded-xl shadow-xl hover:scale-105 transition-transform duration-300">
+        <img src="https://images.unsplash.com/photo-1499914485622-a88fac536970?q=80&w=600&auto=format&fit=crop&ixlib=rb-4.0.3&ixid=M3wxMjA3fDB8MHxwaG90by1wYWdlfHx8fGVufDB8fHx8fA%3D%3D" alt="Free Editing" class="rounded-lg mb-4">
+        <h3 class="text-2xl font-bold mb-2">Fully Customizable</h3>
+        <p>Resize, recolor, reposition — total control over your text edits.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- Call to Action -->
+  <section class="py-20 bg-gradient-to-r from-indigo-500 via-purple-500 to-pink-500 text-white text-center">
+    <h2 class="text-4xl font-bold mb-4">Ready to enhance your images?</h2>
+    <p class="text-lg mb-8">Download EditShot and start editing like a pro.</p>
+    <a href="#" class="bg-white text-indigo-700 font-bold px-8 py-3 rounded-full shadow-lg hover:bg-gray-100 transition-all duration-300">Download Now</a>
+  </section>
+
+  <!-- Contact Section -->
+  <section class="bg-white py-16 px-6 md:px-20">
+    <h2 class="text-3xl font-bold text-center mb-8">Contact Us</h2>
+    <div class="max-w-xl mx-auto text-center text-gray-700">
+      <p class="mb-4">Have questions or feedback? We'd love to hear from you.</p>
+      <p>Email: <a href="https://t.me/Dr5Woods" class="text-blue-600 hover:underline">https://t.me/Dr5Woods</a></p>
+      <p class="mt-2">Follow us on <a href="#" class="text-blue-600 hover:underline">Twitter</a> | <a href="#" class="text-blue-600 hover:underline">Instagram</a></p>
+    </div>
+  </section>
+
+  <!-- Footer -->
+  <footer class="text-center py-8 text-sm text-gray-500 bg-gray-50">
+    &copy; 2025 EditShot. All rights reserved.
+  </footer>
+</body>
+
+</html>
