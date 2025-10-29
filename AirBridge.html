@@ -1,0 +1,702 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="AirBridge - Your Ultimate Local File Transfer Solution. Transfer files instantly across devices on your local network without cables or internet.">
+    <meta name="keywords" content="file transfer, local network, cross-platform, wireless transfer, LAN transfer">
+    <title>AirBridge - Instant Local File Transfer</title>
+    
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        :root {
+            --primary-color: #007AFF;
+            --primary-dark: #0051D5;
+            --secondary-color: #5856D6;
+            --bg-light: #F9FAFB;
+            --bg-white: #FFFFFF;
+            --text-dark: #1F2937;
+            --text-gray: #6B7280;
+            --text-light: #9CA3AF;
+            --border-color: #E5E7EB;
+            --success-color: #10B981;
+            --gradient-1: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            --gradient-2: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+            --gradient-3: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            line-height: 1.6;
+            color: var(--text-dark);
+            background: var(--bg-white);
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 0 20px;
+        }
+        
+        /* Header */
+        header {
+            background: var(--bg-white);
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+        
+        nav {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 1rem 0;
+        }
+        
+        .logo {
+            display: flex;
+            align-items: center;
+            font-size: 1.5rem;
+            font-weight: 700;
+            color: var(--primary-color);
+            text-decoration: none;
+        }
+        
+        .logo-icon {
+            width: 40px;
+            height: 40px;
+            margin-right: 10px;
+            background: var(--gradient-1);
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-weight: bold;
+            font-size: 1.2rem;
+        }
+        
+        .nav-links {
+            display: flex;
+            gap: 2rem;
+            list-style: none;
+        }
+        
+        .nav-links a {
+            color: var(--text-gray);
+            text-decoration: none;
+            font-weight: 500;
+            transition: color 0.3s;
+        }
+        
+        .nav-links a:hover {
+            color: var(--primary-color);
+        }
+        
+        .download-btn {
+            background: var(--primary-color);
+            color: white;
+            padding: 0.75rem 1.5rem;
+            border-radius: 8px;
+            text-decoration: none;
+            font-weight: 600;
+            transition: all 0.3s;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        
+        .download-btn:hover {
+            background: var(--primary-dark);
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0, 122, 255, 0.3);
+        }
+        
+        /* Hero Section */
+        .hero {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 6rem 0;
+            text-align: center;
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .hero::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: url('data:image/svg+xml,<svg width="100" height="100" xmlns="http://www.w3.org/2000/svg"><rect width="100" height="100" fill="none"/><path d="M0 0L50 50L0 100M50 0L100 50L50 100" stroke="white" stroke-opacity="0.05" stroke-width="2" fill="none"/></svg>');
+            opacity: 0.3;
+        }
+        
+        .hero-content {
+            position: relative;
+            z-index: 1;
+        }
+        
+        .hero h1 {
+            font-size: 3.5rem;
+            font-weight: 800;
+            margin-bottom: 1.5rem;
+            line-height: 1.2;
+        }
+        
+        .hero p {
+            font-size: 1.25rem;
+            margin-bottom: 2rem;
+            opacity: 0.95;
+            max-width: 700px;
+            margin-left: auto;
+            margin-right: auto;
+        }
+        
+        .hero-buttons {
+            display: flex;
+            gap: 1rem;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+        
+        .btn-primary {
+            background: white;
+            color: var(--primary-color);
+            padding: 1rem 2rem;
+            border-radius: 10px;
+            text-decoration: none;
+            font-weight: 600;
+            font-size: 1.1rem;
+            transition: all 0.3s;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        
+        .btn-primary:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 10px 25px rgba(0, 0, 0, 0.2);
+        }
+        
+        .btn-secondary {
+            background: rgba(255, 255, 255, 0.2);
+            color: white;
+            padding: 1rem 2rem;
+            border-radius: 10px;
+            text-decoration: none;
+            font-weight: 600;
+            font-size: 1.1rem;
+            transition: all 0.3s;
+            border: 2px solid white;
+        }
+        
+        .btn-secondary:hover {
+            background: rgba(255, 255, 255, 0.3);
+            transform: translateY(-3px);
+        }
+        
+        /* Features Section */
+        .features {
+            padding: 6rem 0;
+            background: var(--bg-light);
+        }
+        
+        .section-title {
+            text-align: center;
+            margin-bottom: 4rem;
+        }
+        
+        .section-title h2 {
+            font-size: 2.5rem;
+            font-weight: 700;
+            margin-bottom: 1rem;
+            color: var(--text-dark);
+        }
+        
+        .section-title p {
+            font-size: 1.125rem;
+            color: var(--text-gray);
+            max-width: 600px;
+            margin: 0 auto;
+        }
+        
+        .features-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 2rem;
+        }
+        
+        .feature-card {
+            background: white;
+            padding: 2.5rem;
+            border-radius: 16px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.05);
+            transition: all 0.3s;
+        }
+        
+        .feature-card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 12px 24px rgba(0, 0, 0, 0.1);
+        }
+        
+        .feature-icon {
+            width: 60px;
+            height: 60px;
+            border-radius: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-bottom: 1.5rem;
+            font-size: 1.8rem;
+        }
+        
+        .feature-icon.icon-1 { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
+        .feature-icon.icon-2 { background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%); }
+        .feature-icon.icon-3 { background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%); }
+        .feature-icon.icon-4 { background: linear-gradient(135deg, #43e97b 0%, #38f9d7 100%); }
+        .feature-icon.icon-5 { background: linear-gradient(135deg, #fa709a 0%, #fee140 100%); }
+        .feature-icon.icon-6 { background: linear-gradient(135deg, #30cfd0 0%, #330867 100%); }
+        
+        .feature-card h3 {
+            font-size: 1.5rem;
+            font-weight: 600;
+            margin-bottom: 1rem;
+            color: var(--text-dark);
+        }
+        
+        .feature-card p {
+            color: var(--text-gray);
+            line-height: 1.7;
+        }
+        
+        /* How It Works */
+        .how-it-works {
+            padding: 6rem 0;
+            background: white;
+        }
+        
+        .steps {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 3rem;
+            margin-top: 3rem;
+        }
+        
+        .step {
+            text-align: center;
+            position: relative;
+        }
+        
+        .step-number {
+            width: 60px;
+            height: 60px;
+            background: var(--gradient-1);
+            color: white;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 1.5rem;
+            font-weight: 700;
+            margin: 0 auto 1.5rem;
+        }
+        
+        .step h3 {
+            font-size: 1.25rem;
+            font-weight: 600;
+            margin-bottom: 0.75rem;
+            color: var(--text-dark);
+        }
+        
+        .step p {
+            color: var(--text-gray);
+            line-height: 1.6;
+        }
+        
+        /* Stats Section */
+        .stats {
+            background: var(--gradient-1);
+            color: white;
+            padding: 4rem 0;
+        }
+        
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 3rem;
+            text-align: center;
+        }
+        
+        .stat h3 {
+            font-size: 3rem;
+            font-weight: 700;
+            margin-bottom: 0.5rem;
+        }
+        
+        .stat p {
+            font-size: 1.125rem;
+            opacity: 0.9;
+        }
+        
+        /* CTA Section */
+        .cta {
+            padding: 6rem 0;
+            background: var(--bg-light);
+            text-align: center;
+        }
+        
+        .cta h2 {
+            font-size: 2.5rem;
+            font-weight: 700;
+            margin-bottom: 1.5rem;
+            color: var(--text-dark);
+        }
+        
+        .cta p {
+            font-size: 1.25rem;
+            color: var(--text-gray);
+            margin-bottom: 2rem;
+            max-width: 600px;
+            margin-left: auto;
+            margin-right: auto;
+        }
+        
+        .app-store-badge {
+            display: inline-block;
+            margin: 0 0.5rem;
+        }
+        
+        .app-store-badge img {
+            height: 50px;
+            transition: transform 0.3s;
+        }
+        
+        .app-store-badge:hover img {
+            transform: scale(1.05);
+        }
+        
+        /* Footer */
+        footer {
+            background: var(--text-dark);
+            color: white;
+            padding: 3rem 0 1.5rem;
+        }
+        
+        .footer-content {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 3rem;
+            margin-bottom: 2rem;
+        }
+        
+        .footer-section h4 {
+            font-size: 1.125rem;
+            font-weight: 600;
+            margin-bottom: 1rem;
+        }
+        
+        .footer-section ul {
+            list-style: none;
+        }
+        
+        .footer-section ul li {
+            margin-bottom: 0.5rem;
+        }
+        
+        .footer-section a {
+            color: var(--text-light);
+            text-decoration: none;
+            transition: color 0.3s;
+        }
+        
+        .footer-section a:hover {
+            color: white;
+        }
+        
+        .footer-bottom {
+            border-top: 1px solid rgba(255, 255, 255, 0.1);
+            padding-top: 1.5rem;
+            text-align: center;
+            color: var(--text-light);
+        }
+        
+        /* Responsive */
+        @media (max-width: 768px) {
+            .hero h1 {
+                font-size: 2.5rem;
+            }
+            
+            .hero p {
+                font-size: 1.125rem;
+            }
+            
+            .nav-links {
+                display: none;
+            }
+            
+            .section-title h2 {
+                font-size: 2rem;
+            }
+            
+            .features-grid {
+                grid-template-columns: 1fr;
+            }
+            
+            .steps {
+                grid-template-columns: 1fr;
+            }
+            
+            .hero-buttons {
+                flex-direction: column;
+                align-items: center;
+            }
+            
+            .btn-primary,
+            .btn-secondary {
+                width: 100%;
+                max-width: 300px;
+                justify-content: center;
+            }
+        }
+        
+        /* Animations */
+        @keyframes fadeInUp {
+            from {
+                opacity: 0;
+                transform: translateY(30px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+        
+        .fade-in-up {
+            animation: fadeInUp 0.6s ease-out;
+        }
+    </style>
+</head>
+<body>
+    <!-- Header -->
+    <header>
+        <nav class="container">
+            <a href="#" class="logo">
+                <div class="logo-icon">A</div>
+                <span>AirBridge</span>
+            </a>
+            <ul class="nav-links">
+                <li><a href="#features">Features</a></li>
+                <li><a href="#how-it-works">How It Works</a></li>
+                <li><a href="#download">Download</a></li>
+            </ul>
+            <a href="https://apps.apple.com/app/id6744686077" class="download-btn">
+                📱 Download Now
+            </a>
+        </nav>
+    </header>
+
+    <!-- Hero Section -->
+    <section class="hero">
+        <div class="container hero-content">
+            <h1 class="fade-in-up">Ditch the Cables,<br>Share Files Instantly</h1>
+            <p class="fade-in-up">Transfer files across devices on your local network without cables or internet restrictions. Fast, secure, and incredibly simple.</p>
+            <div class="hero-buttons">
+                <a href="https://apps.apple.com/app/id6744686077" class="btn-primary">
+                    <span>🍎</span>
+                    <span>Download for iOS</span>
+                </a>
+                <a href="#features" class="btn-secondary">Learn More</a>
+            </div>
+        </div>
+    </section>
+
+    <!-- Features Section -->
+    <section id="features" class="features">
+        <div class="container">
+            <div class="section-title">
+                <h2>Why Choose AirBridge?</h2>
+                <p>Everything you need for seamless local file transfers</p>
+            </div>
+            <div class="features-grid">
+                <div class="feature-card">
+                    <div class="feature-icon icon-1">🌐</div>
+                    <h3>True Cross-Platform</h3>
+                    <p>Works seamlessly across iOS, Android, macOS, Windows, and Linux. Connect any device with a modern web browser.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon icon-2">🔒</div>
+                    <h3>Pure LAN Transfer</h3>
+                    <p>No internet needed! Your files stay private and secure on your local network. Perfect for offline environments.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon icon-3">∞</div>
+                    <h3>Unlimited Sharing</h3>
+                    <p>Transfer photos, videos, documents, music - any file type, any size. No compression or splitting required.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon icon-4">⚡</div>
+                    <h3>Lightning Fast</h3>
+                    <p>Leverage full Wi-Fi speeds for instant transfers. Large files move in seconds, not minutes.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon icon-5">✨</div>
+                    <h3>Minimalist Design</h3>
+                    <p>Intuitive interface with zero-hassle setup. Scan QR code or enter address - start transferring immediately.</p>
+                </div>
+                <div class="feature-card">
+                    <div class="feature-icon icon-6">🪶</div>
+                    <h3>Lightweight App</h3>
+                    <p>Small footprint that won't consume precious storage. Share files anytime, anywhere on your local network.</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- How It Works -->
+    <section id="how-it-works" class="how-it-works">
+        <div class="container">
+            <div class="section-title">
+                <h2>How It Works</h2>
+                <p>Get started in three simple steps</p>
+            </div>
+            <div class="steps">
+                <div class="step">
+                    <div class="step-number">1</div>
+                    <h3>Connect to Wi-Fi</h3>
+                    <p>Make sure your devices are on the same local network or create a mobile hotspot</p>
+                </div>
+                <div class="step">
+                    <div class="step-number">2</div>
+                    <h3>Select & Share</h3>
+                    <p>Choose files from your iOS device and tap "Start Share" to generate a QR code and link</p>
+                </div>
+                <div class="step">
+                    <div class="step-number">3</div>
+                    <h3>Scan & Download</h3>
+                    <p>Open the link on any receiving device's browser and start downloading instantly</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Stats -->
+    <section class="stats">
+        <div class="container">
+            <div class="stats-grid">
+                <div class="stat">
+                    <h3>100%</h3>
+                    <p>Local & Private</p>
+                </div>
+                <div class="stat">
+                    <h3>0</h3>
+                    <p>Internet Required</p>
+                </div>
+                <div class="stat">
+                    <h3>∞</h3>
+                    <p>File Size Limit</p>
+                </div>
+                <div class="stat">
+                    <h3>All</h3>
+                    <p>Platforms Supported</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- CTA Section -->
+    <section id="download" class="cta">
+        <div class="container">
+            <h2>Ready to Experience Free File Sharing?</h2>
+            <p>Download AirBridge now and discover a new era of truly free, simple, and efficient local file sharing!</p>
+            <div>
+                <a href="https://apps.apple.com/app/id6744686077" class="app-store-badge" target="_blank" rel="noopener">
+                    <img src="data:image/svg+xml,%3Csvg width='180' height='60' xmlns='http://www.w3.org/2000/svg'%3E%3Crect width='180' height='60' rx='8' fill='%23000'/%3E%3Ctext x='90' y='35' font-family='Arial' font-size='14' fill='white' text-anchor='middle' font-weight='bold'%3EDownload on the%3C/text%3E%3Ctext x='90' y='50' font-family='Arial' font-size='20' fill='white' text-anchor='middle' font-weight='bold'%3EApp Store%3C/text%3E%3Cpath d='M30,25 L35,15 L40,25 M35,15 L35,35' stroke='white' stroke-width='2' fill='none'/%3E%3C/svg%3E" alt="Download on the App Store">
+                </a>
+            </div>
+            <p style="margin-top: 2rem; font-size: 0.875rem; color: var(--text-light);">
+                <a href="https://www.apple.com/legal/internet-services/itunes/dev/stdeula/" target="_blank" style="color: var(--text-gray); text-decoration: none;">Terms of Use</a>
+            </p>
+        </div>
+    </section>
+
+    <!-- Footer -->
+    <footer>
+        <div class="container">
+            <div class="footer-content">
+                <div class="footer-section">
+                    <h4>AirBridge</h4>
+                    <p style="color: var(--text-light); line-height: 1.6;">Your ultimate local file transfer solution. Fast, secure, and cross-platform.</p>
+                </div>
+                <div class="footer-section">
+                    <h4>Product</h4>
+                    <ul>
+                        <li><a href="#features">Features</a></li>
+                        <li><a href="#how-it-works">How It Works</a></li>
+                        <li><a href="#download">Download</a></li>
+                    </ul>
+                </div>
+                <div class="footer-section">
+                    <h4>Support</h4>
+                    <ul>
+                        <li><a href="https://www.apple.com/legal/internet-services/itunes/dev/stdeula/">Terms of Use</a></li>
+                        <li><a href="https://www.apple.com/legal/privacy/">Privacy Policy</a></li>
+                    </ul>
+                </div>
+                <div class="footer-section">
+                    <h4>Download</h4>
+                    <ul>
+                        <li><a href="https://apps.apple.com/app/id6744686077">iOS App Store</a></li>
+                    </ul>
+                </div>
+            </div>
+            <div class="footer-bottom">
+                <p>&copy; 2025 AirBridge. All rights reserved.</p>
+            </div>
+        </div>
+    </footer>
+
+    <script>
+        // Smooth scrolling for anchor links
+        document.querySelectorAll('a[href^="#"]').forEach(anchor => {
+            anchor.addEventListener('click', function (e) {
+                e.preventDefault();
+                const target = document.querySelector(this.getAttribute('href'));
+                if (target) {
+                    target.scrollIntoView({
+                        behavior: 'smooth',
+                        block: 'start'
+                    });
+                }
+            });
+        });
+
+        // Fade in animations on scroll
+        const observerOptions = {
+            threshold: 0.1,
+            rootMargin: '0px 0px -50px 0px'
+        };
+
+        const observer = new IntersectionObserver((entries) => {
+            entries.forEach(entry => {
+                if (entry.isIntersecting) {
+                    entry.target.classList.add('fade-in-up');
+                    observer.unobserve(entry.target);
+                }
+            });
+        }, observerOptions);
+
+        document.querySelectorAll('.feature-card, .step').forEach(el => {
+            observer.observe(el);
+        });
+    </script>
+</body>
+</html>
+
