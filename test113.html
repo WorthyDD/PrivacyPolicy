@@ -982,15 +982,38 @@ Provide a confidence score (0-100) and a matchup grade (A+ to F).`;
         function attachEventListeners() {
             const app = document.getElementById('app');
 
-            // Global keyboard handling for inputs
-            app.querySelectorAll('input').forEach(input => {
+            // ==================== 修复键盘遮挡问题的通用代码 ====================
+            const navBar = app.querySelector('nav'); // 获取底部导航栏
+            const allInputs = app.querySelectorAll('input[type="text"], textarea'); // 获取当前页面所有输入框
+
+            allInputs.forEach(input => {
+                // 1. 当输入框获得焦点（键盘弹出）
                 input.addEventListener('focus', () => {
-                    document.body.classList.add('keyboard-open');
-                });
-                input.addEventListener('blur', () => {
+                    if (navBar) {
+                        // 将导航栏向下平移出屏幕，避免遮挡
+                        navBar.style.transition = 'transform 0.3s ease';
+                        navBar.style.transform = 'translateY(100%)';
+                    }
+                    
+                    // 延迟 300ms 等待键盘完全弹出后，将输入框滚动到屏幕中心
                     setTimeout(() => {
-                        document.body.classList.remove('keyboard-open');
-                    }, 100);
+                        input.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    }, 300);
+                });
+
+                // 2. 当输入框失去焦点（键盘收起）
+                input.addEventListener('blur', () => {
+                    if (navBar) {
+                        // 恢复导航栏位置
+                        navBar.style.transform = 'translateY(0)';
+                    }
+                });
+
+                // 3. 按下回车键时自动收起键盘 (提升体验)
+                input.addEventListener('keypress', (e) => {
+                    if (e.key === 'Enter') {
+                        input.blur(); // 触发 blur 事件，从而收起键盘并恢复导航栏
+                    }
                 });
             });
 
