@@ -1,0 +1,906 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Destiny Forecast | Five Elements Destiny Reading</title>
+    <meta
+      name="description"
+      content="Destiny Forecast brings 3,000 years of BaZi and Five Elements wisdom into a beautifully designed iPhone app. Explore your elemental balance, zodiac profile, and life trends in seconds."
+    />
+    <style>
+      :root {
+        --bg: #090713;
+        --bg-soft: #120d27;
+        --card: rgba(255, 255, 255, 0.06);
+        --card-strong: rgba(255, 255, 255, 0.1);
+        --border: rgba(255, 255, 255, 0.12);
+        --text: #fff8ef;
+        --muted: rgba(255, 248, 239, 0.72);
+        --gold: #f6c86b;
+        --gold-strong: #ffdb8a;
+        --rose: #d56ba5;
+        --lavender: #8b74ff;
+        --shadow: 0 24px 80px rgba(0, 0, 0, 0.35);
+        --radius-xl: 32px;
+        --radius-lg: 24px;
+        --radius-md: 18px;
+        --max-width: 1200px;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html {
+        scroll-behavior: smooth;
+      }
+
+      body {
+        margin: 0;
+        font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        color: var(--text);
+        background:
+          radial-gradient(circle at top left, rgba(139, 116, 255, 0.28), transparent 28%),
+          radial-gradient(circle at top right, rgba(213, 107, 165, 0.18), transparent 24%),
+          linear-gradient(180deg, #18112f 0%, #0c0a1d 45%, #090713 100%);
+      }
+
+      a {
+        color: inherit;
+        text-decoration: none;
+      }
+
+      img {
+        max-width: 100%;
+        display: block;
+      }
+
+      .container {
+        width: min(calc(100% - 40px), var(--max-width));
+        margin: 0 auto;
+      }
+
+      .site-header {
+        position: sticky;
+        top: 0;
+        z-index: 30;
+        backdrop-filter: blur(18px);
+        background: rgba(9, 7, 19, 0.72);
+        border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+      }
+
+      .nav {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 20px;
+        min-height: 74px;
+      }
+
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+      }
+
+      .brand img {
+        width: 48px;
+        height: 48px;
+        border-radius: 14px;
+        box-shadow: 0 12px 24px rgba(0, 0, 0, 0.24);
+      }
+
+      .brand-title {
+        font-size: 17px;
+        font-weight: 700;
+      }
+
+      .brand-subtitle {
+        margin-top: 2px;
+        color: var(--muted);
+        font-size: 12px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .nav-links {
+        display: flex;
+        align-items: center;
+        gap: 18px;
+        color: var(--muted);
+        font-size: 14px;
+      }
+
+      .nav-links a:hover {
+        color: var(--text);
+      }
+
+      .hero {
+        padding: 72px 0 42px;
+      }
+
+      .hero-grid {
+        display: grid;
+        grid-template-columns: minmax(0, 1.08fr) minmax(320px, 0.92fr);
+        gap: 28px;
+        align-items: stretch;
+      }
+
+      .hero-copy,
+      .hero-download {
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: var(--radius-xl);
+        box-shadow: var(--shadow);
+        backdrop-filter: blur(14px);
+      }
+
+      .hero-copy {
+        padding: 44px;
+        position: relative;
+        overflow: hidden;
+      }
+
+      .hero-copy::after {
+        content: "";
+        position: absolute;
+        right: -100px;
+        top: -80px;
+        width: 280px;
+        height: 280px;
+        border-radius: 50%;
+        background: radial-gradient(circle, rgba(246, 200, 107, 0.18), transparent 68%);
+        pointer-events: none;
+      }
+
+      .eyebrow {
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        padding: 10px 16px;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.06);
+        border: 1px solid var(--border);
+        color: var(--gold);
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .eyebrow::before {
+        content: "";
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--gold);
+        box-shadow: 0 0 18px rgba(246, 200, 107, 0.8);
+      }
+
+      h1 {
+        margin: 22px 0 18px;
+        font-size: clamp(44px, 8vw, 72px);
+        line-height: 0.94;
+        letter-spacing: -0.05em;
+      }
+
+      .hero-lead {
+        max-width: 620px;
+        margin: 0;
+        color: var(--muted);
+        font-size: 18px;
+        line-height: 1.8;
+      }
+
+      .hero-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 14px;
+        margin-top: 28px;
+      }
+
+      .button-primary,
+      .button-secondary {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-height: 52px;
+        padding: 0 22px;
+        border-radius: 999px;
+        font-weight: 700;
+        transition: transform 180ms ease, opacity 180ms ease, background 180ms ease;
+      }
+
+      .button-primary:hover,
+      .button-secondary:hover {
+        transform: translateY(-1px);
+      }
+
+      .button-primary {
+        background: linear-gradient(90deg, var(--gold) 0%, #f0b470 52%, #e07ad6 100%);
+        color: #2c1808;
+      }
+
+      .button-secondary {
+        border: 1px solid var(--border);
+        background: rgba(255, 255, 255, 0.04);
+        color: var(--text);
+      }
+
+      .hero-metrics {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 14px;
+        margin-top: 30px;
+      }
+
+      .metric {
+        padding: 18px;
+        border-radius: var(--radius-md);
+        background: rgba(255, 255, 255, 0.04);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+      }
+
+      .metric strong {
+        display: block;
+        font-size: 26px;
+        line-height: 1;
+        letter-spacing: -0.04em;
+      }
+
+      .metric span {
+        display: block;
+        margin-top: 8px;
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.5;
+      }
+
+      .hero-download {
+        padding: 28px;
+        display: grid;
+        gap: 20px;
+        align-content: start;
+      }
+
+      .qr-card {
+        display: grid;
+        grid-template-columns: 1fr;
+        gap: 16px;
+        padding: 20px;
+        border-radius: var(--radius-lg);
+        background: rgba(255, 255, 255, 0.05);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+      }
+
+      .qr-frame {
+        width: min(100%, 240px);
+        aspect-ratio: 1 / 1;
+        margin: 0 auto;
+        padding: 14px;
+        border-radius: 24px;
+        background: #fff;
+      }
+
+      .qr-frame img {
+        width: 100%;
+        height: 100%;
+        object-fit: contain;
+      }
+
+      .qr-title {
+        font-size: 22px;
+        font-weight: 700;
+      }
+
+      .qr-text {
+        margin: 0;
+        color: var(--muted);
+        line-height: 1.7;
+      }
+
+      .download-link {
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        font-size: 14px;
+        color: var(--gold-strong);
+        word-break: break-all;
+      }
+
+      .section {
+        padding: 34px 0;
+      }
+
+      .section-heading {
+        max-width: 720px;
+        margin-bottom: 24px;
+      }
+
+      .section-kicker {
+        color: var(--gold);
+        text-transform: uppercase;
+        letter-spacing: 0.16em;
+        font-size: 12px;
+        font-weight: 700;
+      }
+
+      .section-heading h2 {
+        margin: 10px 0 0;
+        font-size: clamp(30px, 5vw, 46px);
+        line-height: 1;
+        letter-spacing: -0.04em;
+      }
+
+      .section-heading p {
+        margin: 14px 0 0;
+        color: var(--muted);
+        font-size: 17px;
+        line-height: 1.8;
+      }
+
+      .feature-grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 18px;
+      }
+
+      .feature-card,
+      .step-card,
+      .highlight-card {
+        padding: 24px;
+        border-radius: var(--radius-lg);
+        background: var(--card);
+        border: 1px solid var(--border);
+        box-shadow: var(--shadow);
+      }
+
+      .feature-card h3,
+      .step-card h3,
+      .highlight-card h3 {
+        margin: 18px 0 10px;
+        font-size: 20px;
+      }
+
+      .feature-card p,
+      .step-card p,
+      .highlight-card p {
+        margin: 0;
+        color: var(--muted);
+        line-height: 1.75;
+        font-size: 15px;
+      }
+
+      .feature-icon {
+        width: 48px;
+        height: 48px;
+        border-radius: 16px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        background: linear-gradient(180deg, rgba(246, 200, 107, 0.18), rgba(139, 116, 255, 0.15));
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        font-size: 22px;
+      }
+
+      .story-grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 18px;
+      }
+
+      .step-number {
+        display: inline-flex;
+        width: 36px;
+        height: 36px;
+        border-radius: 999px;
+        align-items: center;
+        justify-content: center;
+        background: rgba(246, 200, 107, 0.14);
+        color: var(--gold);
+        font-weight: 800;
+      }
+
+      .screenshot-grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 18px;
+      }
+
+      .screenshot-card {
+        position: relative;
+        overflow: hidden;
+        border-radius: 28px;
+        background: rgba(255, 255, 255, 0.05);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        box-shadow: var(--shadow);
+      }
+
+      .screenshot-card img {
+        width: 100%;
+        aspect-ratio: 430 / 932;
+        object-fit: cover;
+        object-position: top;
+      }
+
+      .screenshot-label {
+        position: absolute;
+        left: 14px;
+        right: 14px;
+        bottom: 14px;
+        padding: 14px 16px;
+        border-radius: 18px;
+        background: rgba(7, 6, 15, 0.72);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        backdrop-filter: blur(14px);
+      }
+
+      .screenshot-label strong {
+        display: block;
+        font-size: 14px;
+      }
+
+      .screenshot-label span {
+        display: block;
+        margin-top: 4px;
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.5;
+      }
+
+      .highlight-grid {
+        display: grid;
+        grid-template-columns: 1.1fr 0.9fr;
+        gap: 18px;
+      }
+
+      .highlight-stack {
+        display: grid;
+        gap: 18px;
+      }
+
+      .pill-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        margin-top: 18px;
+      }
+
+      .pill {
+        padding: 10px 14px;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.05);
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .download-panel {
+        margin-top: 14px;
+        padding: 28px;
+        border-radius: var(--radius-xl);
+        background:
+          radial-gradient(circle at top right, rgba(246, 200, 107, 0.18), transparent 26%),
+          linear-gradient(180deg, rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0.04));
+        border: 1px solid var(--border);
+        box-shadow: var(--shadow);
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) 260px;
+        gap: 20px;
+        align-items: center;
+      }
+
+      .download-panel h3 {
+        margin: 0 0 12px;
+        font-size: 32px;
+        letter-spacing: -0.04em;
+      }
+
+      .download-panel p {
+        margin: 0;
+        color: var(--muted);
+        line-height: 1.8;
+      }
+
+      .download-box {
+        padding: 16px;
+        border-radius: 24px;
+        background: rgba(8, 7, 18, 0.55);
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        text-align: center;
+      }
+
+      .download-box small {
+        display: block;
+        margin-top: 12px;
+        color: var(--muted);
+        line-height: 1.6;
+      }
+
+      .site-footer {
+        padding: 36px 0 60px;
+        color: var(--muted);
+      }
+
+      .footer-grid {
+        display: flex;
+        flex-wrap: wrap;
+        justify-content: space-between;
+        gap: 14px;
+        padding-top: 22px;
+        border-top: 1px solid rgba(255, 255, 255, 0.08);
+      }
+
+      .footer-links {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 16px;
+      }
+
+      .notice {
+        margin-top: 14px;
+        color: rgba(255, 248, 239, 0.54);
+        font-size: 13px;
+        line-height: 1.7;
+      }
+
+      @media (max-width: 1080px) {
+        .hero-grid,
+        .highlight-grid,
+        .download-panel,
+        .feature-grid,
+        .story-grid,
+        .screenshot-grid {
+          grid-template-columns: 1fr 1fr;
+        }
+
+        .hero-copy {
+          padding: 34px;
+        }
+      }
+
+      @media (max-width: 720px) {
+        .container {
+          width: min(calc(100% - 28px), var(--max-width));
+        }
+
+        .nav {
+          min-height: 66px;
+        }
+
+        .nav-links {
+          display: none;
+        }
+
+        .hero {
+          padding-top: 36px;
+        }
+
+        .hero-grid,
+        .highlight-grid,
+        .download-panel,
+        .feature-grid,
+        .story-grid,
+        .screenshot-grid,
+        .hero-metrics {
+          grid-template-columns: 1fr;
+        }
+
+        .hero-copy,
+        .hero-download,
+        .feature-card,
+        .step-card,
+        .highlight-card,
+        .download-panel {
+          padding: 22px;
+        }
+
+        .hero-actions {
+          flex-direction: column;
+        }
+
+        .button-primary,
+        .button-secondary {
+          width: 100%;
+        }
+
+        h1 {
+          font-size: 44px;
+        }
+
+        .download-panel h3 {
+          font-size: 28px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <header class="site-header">
+      <div class="container nav">
+        <a class="brand" href="#top">
+          <img src="https://i.ibb.co/20WLD7sS/destiny-logo.jpg" alt="Destiny Forecast app icon" />
+          <div>
+            <div class="brand-title">Destiny Forecast</div>
+            <div class="brand-subtitle">BaZi / Five Elements</div>
+          </div>
+        </a>
+        <nav class="nav-links">
+          <a href="#features">Features</a>
+          <a href="#screens">Screens</a>
+          <a href="#about">Why It Matters</a>
+          <a href="#download">Download</a>
+        </nav>
+      </div>
+    </header>
+
+    <main id="top">
+      <section class="hero">
+        <div class="container hero-grid">
+          <div class="hero-copy">
+            <div class="eyebrow">Ancient wisdom, modern clarity</div>
+            <h1>See what the elements reveal.</h1>
+            <p class="hero-lead">
+              Destiny Forecast turns 3,000 years of Eastern BaZi wisdom into an elegant,
+              easy-to-read mobile experience. Enter your birth time and instantly explore
+              your Five Elements balance, zodiac profile, Four Pillars, and deep life trends.
+            </p>
+            <div class="hero-actions">
+              <a class="button-primary" data-app-link href="#">Download on the App Store</a>
+              <a class="button-secondary" href="#screens">Preview the experience</a>
+            </div>
+            <div class="hero-metrics">
+              <div class="metric">
+                <strong>5</strong>
+                <span>Elemental forces visualized in one proprietary radar chart.</span>
+              </div>
+              <div class="metric">
+                <strong>3000</strong>
+                <span>Years of Taoist and BaZi tradition distilled into one app.</span>
+              </div>
+              <div class="metric">
+                <strong>8</strong>
+                <span>Languages supported for a global audience of curious seekers.</span>
+              </div>
+            </div>
+          </div>
+
+          <aside class="hero-download">
+            <div class="qr-card">
+              <div class="qr-title">Scan to download</div>
+              <p class="qr-text">
+                Open the App Store page on your phone in one step. The QR code and button below
+                both point to the same download link.
+              </p>
+              <div class="qr-frame">
+                <img id="qrImage" alt="Download Destiny Forecast QR code" />
+              </div>
+              <a class="button-primary" data-app-link href="#">Get Destiny Forecast</a>
+              <a class="download-link" id="appStoreUrl" data-app-link href="#"></a>
+            </div>
+            <p class="notice">
+              Update the App Store URL inside the script at the bottom of this file before
+              publishing if your listing link changes.
+            </p>
+          </aside>
+        </div>
+      </section>
+
+      <section class="section" id="features">
+        <div class="container">
+          <div class="section-heading">
+            <div class="section-kicker">Core Features</div>
+            <h2>Built for people who want more than a horoscope.</h2>
+            <p>
+              Destiny Forecast goes beyond surface-level fortune content. It combines classical
+              Chinese metaphysics, clear visual design, and private on-device storage to make a
+              rich tradition feel personal and accessible.
+            </p>
+          </div>
+          <div class="feature-grid">
+            <article class="feature-card">
+              <div class="feature-icon">5</div>
+              <h3>Five Elements Radar</h3>
+              <p>
+                Visualize Wood, Fire, Earth, Metal, and Water in a single chart designed to make
+                elemental balance readable at a glance.
+              </p>
+            </article>
+            <article class="feature-card">
+              <div class="feature-icon">D</div>
+              <h3>Deep Destiny Reading</h3>
+              <p>
+                Explore guidance around career, wealth, health, relationships, luck cycles, and
+                personality through a master-inspired BaZi framework.
+              </p>
+            </article>
+            <article class="feature-card">
+              <div class="feature-icon">B</div>
+              <h3>Traditional Methods</h3>
+              <p>
+                Includes Four Pillars, Na Yin Five Elements, zodiac interpretation, and classical
+                structures preserved from longstanding Eastern practice.
+              </p>
+            </article>
+            <article class="feature-card">
+              <div class="feature-icon">P</div>
+              <h3>Privacy First</h3>
+              <p>
+                Your birth data and readings stay on your device. No personal destiny data needs
+                to be uploaded to enjoy the full experience.
+              </p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section class="section">
+        <div class="container">
+          <div class="section-heading">
+            <div class="section-kicker">How It Works</div>
+            <h2>From birth time to insight in minutes.</h2>
+          </div>
+          <div class="story-grid">
+            <article class="step-card">
+              <div class="step-number">1</div>
+              <h3>Enter your birth details</h3>
+              <p>
+                Add your date and birth hour to generate the foundation of your Four Pillars and
+                element profile.
+              </p>
+            </article>
+            <article class="step-card">
+              <div class="step-number">2</div>
+              <h3>Review your chart</h3>
+              <p>
+                See your elemental balance, zodiac information, and symbolic structure presented
+                in a clean mobile interface.
+              </p>
+            </article>
+            <article class="step-card">
+              <div class="step-number">3</div>
+              <h3>Explore life trends</h3>
+              <p>
+                Dive into longer-form interpretation for career paths, health tendencies,
+                personality, relationships, and fortune cycles.
+              </p>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section class="section" id="screens">
+        <div class="container">
+          <div class="section-heading">
+            <div class="section-kicker">App Preview</div>
+            <h2>A premium reading experience, designed for the phone.</h2>
+            <p>
+              These screens highlight the visual tone of the app: mystical, calm, modern, and
+              rooted in classical symbolism.
+            </p>
+          </div>
+          <div class="screenshot-grid">
+            <article class="screenshot-card">
+              <img src="https://i.ibb.co/prvp5qfc/01-elements.jpg" alt="Five Elements radar chart screen" />
+              <div class="screenshot-label">
+                <strong>Elemental Balance</strong>
+                <span>Understand your strongest and weakest forces at a glance.</span>
+              </div>
+            </article>
+            <article class="screenshot-card">
+              <img src="https://i.ibb.co/fYfDzYgn/02-wisdom.jpg" alt="Ancient wisdom summary screen" />
+              <div class="screenshot-label">
+                <strong>Ancient Wisdom</strong>
+                <span>See zodiac, Four Pillars, and Na Yin presented in one flow.</span>
+              </div>
+            </article>
+            <article class="screenshot-card">
+              <img src="https://i.ibb.co/CsYvd8L6/03-analysis.jpg" alt="Life analysis screen" />
+              <div class="screenshot-label">
+                <strong>Career / Health / Destiny</strong>
+                <span>Read deeper interpretation inspired by classical BaZi theory.</span>
+              </div>
+            </article>
+            <article class="screenshot-card">
+              <img src="https://i.ibb.co/Q7sL4NbH/04-birth-hour.jpg" alt="Birth hour entry screen" />
+              <div class="screenshot-label">
+                <strong>Birth Hour Input</strong>
+                <span>Use the Luopan-inspired interface to start your reading.</span>
+              </div>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section class="section" id="about">
+        <div class="container">
+          <div class="section-heading">
+            <div class="section-kicker">Why Destiny Forecast</div>
+            <h2>Grounded in tradition. Built for modern curiosity.</h2>
+          </div>
+          <div class="highlight-grid">
+            <article class="highlight-card">
+              <h3>More than a pop-astrology app</h3>
+              <p>
+                Destiny Forecast is shaped around BaZi, the Four Pillars of Destiny, a system that
+                interprets the year, month, day, and hour of birth through Heavenly Stems, Earthly
+                Branches, and the Five Elements.
+              </p>
+              <div class="pill-row">
+                <span class="pill">Four Pillars</span>
+                <span class="pill">Na Yin</span>
+                <span class="pill">Chinese Zodiac</span>
+                <span class="pill">Luck Cycles</span>
+                <span class="pill">Five Elements</span>
+              </div>
+            </article>
+            <div class="highlight-stack">
+              <article class="highlight-card">
+                <h3>Elegant, visual, readable</h3>
+                <p>
+                  The app transforms dense metaphysical ideas into a refined visual experience that
+                  feels native, warm, and premium rather than overwhelming.
+                </p>
+              </article>
+              <article class="highlight-card">
+                <h3>Made for a global audience</h3>
+                <p>
+                  Designed for users exploring Eastern philosophy, spirituality, personal insight,
+                  or a deeper alternative to Western horoscopes.
+                </p>
+              </article>
+            </div>
+          </div>
+
+          <div class="download-panel" id="download">
+            <div>
+              <h3>Download Destiny Forecast today.</h3>
+              <p>
+                Scan the QR code on the right or open the App Store listing directly. Perfect for
+                product pages, campaign landing pages, or a lightweight app homepage.
+              </p>
+              <div class="hero-actions" style="margin-top: 20px;">
+                <a class="button-primary" data-app-link href="#">Open App Store</a>
+              </div>
+            </div>
+            <div class="download-box">
+              <div class="qr-frame" style="width: 100%; max-width: none; margin: 0;">
+                <img id="qrImageSecondary" alt="Secondary download QR code" />
+              </div>
+              <small>Scan with your iPhone camera to open the download page.</small>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <div class="container">
+        <div class="footer-grid">
+          <div>
+            <strong>Destiny Forecast</strong><br />
+            <span>See what the elements reveal.</span>
+          </div>
+          <div class="footer-links">
+            <a href="#features">Features</a>
+            <a href="#screens">Screens</a>
+            <a href="#download">Download</a>
+          </div>
+        </div>
+      </div>
+    </footer>
+
+    <script>
+      const APP_STORE_URL = "https://apps.apple.com/app/id6761984431";
+      const QR_URL = "https://i.ibb.co/Ld6Zbbwn/qrcode.png";
+
+      document.querySelectorAll("[data-app-link]").forEach((link) => {
+        link.href = APP_STORE_URL;
+      });
+
+      document.getElementById("appStoreUrl").textContent = APP_STORE_URL;
+      document.getElementById("qrImage").src = QR_URL;
+      document.getElementById("qrImageSecondary").src = QR_URL;
+    </script>
+  </body>
+</html>
