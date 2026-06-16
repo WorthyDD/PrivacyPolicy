@@ -54,8 +54,8 @@
       height: 100%;
       overflow: hidden;
       border-radius: 24px;
-      border: 1px solid rgba(255, 255, 255, .05);
-      background: #1a1a1a
+      border: none;
+      background: transparent
     }
 
     .game-area iframe {
@@ -1057,27 +1057,134 @@
       return 'disconnected';
     }
 
-    // 通过 /user/v2/getUserInfo 补全 player 的 name / avatar。numeric userId
-    // 才走后端查询；非数字 fallback 为 id 本身（guest / system 用户）。
-    function mpFetchUserInfo(userId) {
-      var idStr = String(userId || '');
-      if (!idStr) return Promise.resolve({ playerId: '', playerName: '', playerAvatar: '' });
+    // ── player 信息映射 ──────────────────────────────────────────────────
+    // 把 bridge / 旧 getUserInfo 返回的 user 对象映射成 web 侧约定的
+    // player 三元组。新接口的用户主键字段是 `id`（旧接口是 userId），这里以
+    // 传入的 idStr 为准做兜底，避免 user 缺失时丢玩家。
+    function mpUserToPlayer(idStr, user) {
+      var resolvedId = user && (user.id != null ? user.id : user.userId);
+      return {
+        playerId: String(resolvedId || idStr),
+        playerName: (user && user.userName) || idStr,
+        playerAvatar: (user && user.avatarUrl) || '',
+      };
+    }
+
+    // 非数字 userId 视为 guest / system 用户，不走后端、直接以 id 兜底。
+    function mpIsQueryableUserId(idStr) {
       var n = Number(idStr);
-      if (!isFinite(n) || String(n) !== idStr) {
-        return Promise.resolve({ playerId: idStr, playerName: idStr, playerAvatar: '' });
+      return !!idStr && isFinite(n) && String(n) === idStr;
+    }
+
+    // 通过 Flutter bridge 的 getUserInfoBatch 一次拿一组 user。mpBridgeCall 内部
+    // 已做 mpParseBridgeResponse 解析，这里只校验返回结构；bridge 不支持 / 失败
+    // 一律返回 null 交给调用方走 HTML 直连兜底。
+    function mpBridgeFetchUserInfoBatch(queryableIds) {
+      if (!queryableIds || !queryableIds.length) {
+        return Promise.resolve(null);
       }
+      return mpBridgeCall('getUserInfoBatch', {
+        userIds: queryableIds.map(Number),
+      }).then(function (result) {
+        if (!result || result.success !== true || !result.users) return null;
+        return result.users;
+      }).catch(function () {
+        return null;
+      });
+    }
+
+    // bridge 单条目 → player 三元组。兼容两种返回：已成型的 player，或原始 user。
+    function mpPlayerFromBridgeUser(idStr, entry) {
+      if (!entry) return null;
+      if (entry.player) {
+        return {
+          playerId: String(entry.player.playerId || idStr),
+          playerName: entry.player.playerName || idStr,
+          playerAvatar: entry.player.playerAvatar || '',
+        };
+      }
+      if (entry.user) {
+        return mpUserToPlayer(idStr, entry.user);
+      }
+      return null;
+    }
+
+    function mpFetchUserInfoViaApi(idStr) {
       return callApiGet('/user/v2/getUserInfo', { userId: idStr })
         .then(function (r) { return r.json(); })
         .then(function (result) {
           var user = result && result.data && result.data.user;
-          return {
-            playerId: idStr,
-            playerName: (user && user.userName) || idStr,
-            playerAvatar: (user && user.avatarUrl) || '',
-          };
+          return mpUserToPlayer(idStr, user);
         })
         .catch(function () {
-          return { playerId: idStr, playerName: idStr, playerAvatar: '' };
+          return mpUserToPlayer(idStr, null);
+        });
+    }
+
+    // 单个查询：优先走 Flutter bridge，避免 WebView CORS；旧 app / bridge 失败时
+    // 回退到 HTML 原本使用的 GET /user/v2/getUserInfo。
+    function mpFetchUserInfo(userId) {
+      var idStr = String(userId || '');
+      if (!mpIsQueryableUserId(idStr)) {
+        return Promise.resolve(mpUserToPlayer(idStr, null));
+      }
+      return mpBridgeFetchUserInfoBatch([idStr]).then(function (users) {
+        var bridged = mpPlayerFromBridgeUser(idStr, users && users[idStr]);
+        if (bridged) return bridged;
+        // TODO: remove XHR fallback after Flutter bridge coverage = 100%.
+        return mpFetchUserInfoViaApi(idStr);
+      });
+    }
+
+    // 批量查询：优先用 Flutter bridge 一次拿一组 player，绕过 HTML CORS；
+    // 旧 app / bridge 失败时回退到 HTML 原本的 /user/v2/getUserInfo 逐个查询。
+    // 非数字 id 不入后端查询，原位以 id 兜底；返回顺序与入参 members 一一对应。
+    function mpFetchUserInfoBatch(userIds) {
+      var idStrs = (userIds || []).map(function (u) { return String(u || ''); });
+      var queryable = idStrs.filter(mpIsQueryableUserId);
+      if (!queryable.length) {
+        return Promise.resolve(idStrs.map(function (id) { return mpUserToPlayer(id, null); }));
+      }
+      return mpBridgeFetchUserInfoBatch(queryable).then(function (users) {
+        if (users) {
+          return idStrs.map(function (id) {
+            var bridged = mpIsQueryableUserId(id) ? mpPlayerFromBridgeUser(id, users[id]) : null;
+            return bridged || mpUserToPlayer(id, null);
+          });
+        }
+        // TODO: remove XHR fallback after Flutter bridge coverage = 100%.
+        return Promise.all(idStrs.map(function (id) {
+          return mpIsQueryableUserId(id) ? mpFetchUserInfoViaApi(id) : mpUserToPlayer(id, null);
+        }));
+      });
+    }
+
+    // get_player_info 用：bridge 返回的是 user 形态（带 countryCode），优先取
+    // entry.user；若只回了 player 三元组，则反向拼回一个 user-like 对象。
+    function mpBridgeFetchSelfUser(userId) {
+      var idStr = String(userId || '');
+      if (!mpIsQueryableUserId(idStr)) return Promise.resolve(null);
+      return mpBridgeFetchUserInfoBatch([idStr]).then(function (users) {
+        var entry = users && users[idStr];
+        if (!entry) return null;
+        if (entry.user) return entry.user;
+        if (entry.player) {
+          return {
+            id: Number(entry.player.playerId || idStr),
+            userName: entry.player.playerName || idStr,
+            avatarUrl: entry.player.playerAvatar || '',
+            countryCode: entry.player.countryCode || 'US',
+          };
+        }
+        return null;
+      });
+    }
+
+    function mpFetchSelfUserViaApi(userId) {
+      return callApiGet('/user/v2/getUserInfo', { userId: userId })
+        .then(function (r) { return r.json(); })
+        .then(function (result) {
+          return result && result.data && result.data.user;
         });
     }
 
@@ -1214,7 +1321,7 @@
             : [String(_userId)];
           var selfId = String(_userId);
 
-          return Promise.all(members.map(mpFetchUserInfo)).then(function (infos) {
+          return mpFetchUserInfoBatch(members).then(function (infos) {
             mp.players = {};
             for (var i = 0; i < infos.length; i++) {
               var info = infos[i];
@@ -2151,17 +2258,22 @@
 
         case 'get_player_info': {
           if (!_authToken || _isTourist || !_userId) { reply(data.taskId, 'receive_player_info', null); break; }
-          callApiGet('/user/v2/getUserInfo', { userId: _userId })
-            .then(function (r) { return r.json(); })
-            .then(function (result) {
-              var user = result && result.data && result.data.user;
+          // 优先走 Flutter bridge，避免 HTML 直连 user/info 的 CORS；旧 app 兜底直连。
+          mpBridgeFetchSelfUser(_userId)
+            .then(function (user) {
+              if (user) return user;
+              // TODO: remove XHR fallback after Flutter bridge coverage = 100%.
+              return mpFetchSelfUserViaApi(_userId);
+            })
+            .then(function (user) {
               if (!user) { reply(data.taskId, 'receive_player_info', null); return; }
+              var resolvedId = user.id != null ? user.id : user.userId;
               reply(data.taskId, 'receive_player_info', {
-                userId: String(user.userId),
+                userId: String(resolvedId),
                 username: user.userName,
                 avatar: user.avatarUrl,
                 countryCode: user.countryCode || 'US',
-                isCreator: !!(user.userId && String(user.userId) === String(GAME.creator_user_id)),
+                isCreator: !!(resolvedId && String(resolvedId) === String(GAME.creator_user_id)),
               });
             })
             .catch(function () { reply(data.taskId, 'receive_player_info', null); });
