@@ -1,0 +1,1286 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <!--  同 shell：把 sensor 类 feature 放开到 *，否则委托到 blob: 子 iframe 时被切。 -->
+  <meta http-equiv="Permissions-Policy"
+    content="accelerometer=*, gyroscope=*, magnetometer=*, camera=*, microphone=*, autoplay=*, fullscreen=*, clipboard-read=*, clipboard-write=*">
+  <title>Game Frame</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box
+    }
+
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #000;
+      touch-action: none
+    }
+
+    iframe {
+      width: 100%;
+      height: 100%;
+      border: none;
+      display: block;
+      background: #000;
+      touch-action: none
+    }
+  </style>
+</head>
+
+<body>
+  <iframe id="content-frame"
+    sandbox="allow-scripts allow-same-origin allow-popups allow-pointer-lock allow-modals allow-forms"
+    allow="autoplay; camera; microphone; clipboard-read; clipboard-write; gyroscope; accelerometer; fullscreen"
+    scrolling="no"></iframe>
+  <script>
+    var _gameUrl = '';
+    var _requestedMuted = false;
+    var _blobUrl = null;
+    var _loadToken = 0;
+    var _delayDomReadyForHairGuard = false;
+    var _hairGuardReady = false;
+    var _pendingHairGuardDomReady = null;
+    var _lastRuntimeLifecycleType = null;
+    var FRAME_VIBRATION_MAX_DURATION_MS = 60;
+    var _frameVibrationGateOpen = true;
+
+    // ─── perf trace (临时调试，验证完删除) ──────────────────────────────
+    // 每次 loadGameContent 重置 base，单条 log 自带 Δ(上一阶段) + total(累计)
+    // 输出到 console + 透传给父 shell（postMessage type=sekai_feed_frame_perf）
+    // 让宿主侧也能聚合一份完整链路。
+    var _perfBase = 0;
+    var _perfLast = 0;
+    function perfReset(tag, extra) {
+      _perfBase = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+      _perfLast = _perfBase;
+      perf(tag, extra);
+    }
+    function perf(tag, extra) {
+      var now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+      var d = (now - _perfLast).toFixed(0);
+      var t = (now - _perfBase).toFixed(0);
+      _perfLast = now;
+      var line = '[GameFramePerf] ' + tag + ' Δ=' + d + 'ms total=' + t + 'ms token=' + _loadToken;
+      if (extra) { try { line += ' ' + JSON.stringify(extra); } catch (_e) {} }
+      try { console.log(line); } catch (_e) {}
+      try {
+        window.parent.postMessage({
+          type: 'sekai_feed_frame_perf',
+          scope: 'frame',
+          tag: tag,
+          delta_ms: Number(d),
+          total_ms: Number(t),
+          token: _loadToken,
+          extra: extra || null,
+        }, '*');
+      } catch (_e) {}
+    }
+    // ────────────────────────────────────────────────────────────────────
+
+    // 诊断日志：默认关。需排查时临时改为 true，会同时 console.log 并通过
+    // postMessage 冒泡到外层 WebView 宿主（Flutter / devtools 都能看到）。
+    var _dbgEnabled = false;
+    function dbg(tag, payload) {
+      if (!_dbgEnabled) return;
+      try {
+        var line = '[sekai-frame] ' + tag + (payload !== undefined ? ' ' + JSON.stringify(payload) : '');
+        if (typeof console !== 'undefined' && console.log) console.log(line);
+      } catch (_e) {}
+      try {
+        window.parent.postMessage({
+          type: 'sekai_feed_frame_debug',
+          scope: 'frame',
+          tag: tag,
+          payload: payload,
+          t: Date.now(),
+        }, '*');
+      } catch (_e) {}
+    }
+
+    function clampVibrationDuration(duration) {
+      var value = Number(duration);
+      if (!isFinite(value) || value <= 0) return 15;
+      return Math.min(Math.round(value), FRAME_VIBRATION_MAX_DURATION_MS);
+    }
+
+    function extractFrameVibrationDuration(sourceData) {
+      if (sourceData && Array.isArray(sourceData.pattern)) {
+        var maxDuration = 0;
+        for (var i = 0; i < sourceData.pattern.length; i++) {
+          maxDuration = Math.max(maxDuration, clampVibrationDuration(sourceData.pattern[i]));
+        }
+        if (maxDuration > 0) return maxDuration;
+      }
+      return clampVibrationDuration(sourceData && sourceData.duration);
+    }
+
+    function canForwardFrameVibration() {
+      return _frameVibrationGateOpen && document.visibilityState !== 'hidden';
+    }
+
+    function normalizeFrameVibrationMessage(message) {
+      if (!message || (message.action !== 'gen_vibration' && message.action !== 'vibrate')) {
+        return null;
+      }
+      var sourceData = (message.data && typeof message.data === 'object') ? message.data : {};
+      return {
+        action: 'gen_vibration',
+        data: {
+          type: typeof sourceData.type === 'string' ? sourceData.type : 'light',
+          duration: extractFrameVibrationDuration(sourceData),
+          source: sourceData.source || 'frame_bridge',
+        },
+      };
+    }
+
+    function forwardFrameVibration(message) {
+      if (!canForwardFrameVibration()) return false;
+      var nextMessage = normalizeFrameVibrationMessage(message);
+      if (!nextMessage) return false;
+      postToParent(nextMessage);
+      return true;
+    }
+
+    function clearFrameVibrationState() {
+      try {
+        if (navigator.vibrate) navigator.vibrate(0);
+      } catch (_e) {}
+    }
+
+    function buildInjectedVibrationGovernorScript() {
+      return [
+        '(function(){',
+        'if(window.__sekai_vibration_governor_installed)return;',
+        'window.__sekai_vibration_governor_installed=true;',
+        'var MAX_DURATION_MS=60;',
+        'var gateOpen=true;',
+        'var originalVibrate=typeof navigator!==\"undefined\"&&navigator.vibrate?navigator.vibrate.bind(navigator):null;',
+        'function clampValue(value){var num=Number(value);if(!isFinite(num)||num<=0)return 0;return Math.min(Math.round(num),MAX_DURATION_MS);}',
+        'function extractDuration(pattern){if(Array.isArray(pattern)){var maxDuration=0;for(var i=0;i<pattern.length;i++){maxDuration=Math.max(maxDuration,clampValue(pattern[i]));}return maxDuration;}return clampValue(pattern);}',
+        'function stopOnly(){if(originalVibrate){try{originalVibrate(0);}catch(_){}}}',
+        'function forward(pattern){if(!gateOpen)return false;var duration=extractDuration(pattern);if(duration<=0)return false;try{window.parent.postMessage({action:\"gen_vibration\",data:{type:\"light\",duration:duration,source:\"navigator_vibrate\"}},\"*\");return true;}catch(_){return false;}}',
+        'function closeGate(){gateOpen=false;stopOnly();}',
+        'function openGate(){gateOpen=true;}',
+        'if(originalVibrate){navigator.vibrate=function(pattern){if(pattern===0)return stopOnly(),true;if(Array.isArray(pattern)){var hasPositive=false;for(var i=0;i<pattern.length;i++){if(clampValue(pattern[i])>0){hasPositive=true;break;}}if(!hasPositive)return stopOnly(),true;}return forward(pattern);};}',
+        'window.__sekaiVibrationGovernor={stop:closeGate,resume:openGate,forward:forward};',
+        'document.addEventListener(\"visibilitychange\",function(){if(document.visibilityState===\"hidden\")closeGate();});',
+        'window.addEventListener(\"message\",function(ev){var data=ev.data;if(typeof data===\"string\"){try{data=JSON.parse(data);}catch(_){return;}}if(!data)return;if(data.type===\"sekai:cancel_vibration\")closeGate();if(data.type===\"sekai:resume_vibration\")openGate();});',
+        '})();',
+      ].join('');
+    }
+
+    function contentFrame() {
+      return document.getElementById('content-frame');
+    }
+
+    function isRemoteUrl(url) {
+      return /^https?:\/\//i.test(url || '');
+    }
+
+    function isAbsoluteLocalUrl(url) {
+      return /^(file|blob|data):/i.test(url || '');
+    }
+
+    function resolveLocalUrl(url) {
+      if (!url) return 'about:blank';
+      if (isAbsoluteLocalUrl(url) || isRemoteUrl(url)) return url;
+      if (url.indexOf('assets/') === 0) return '../' + url;
+      return url;
+    }
+
+    function buildLocalClickCompatScriptTag() {
+      // file:// 下 WKWebView 合成的 MouseEvent('click') 通过 dispatchEvent 不会
+      // 触发元素的 onclick 属性处理程序（https:// 下正常）。游戏模板自带的
+      // compat 把 addEventListener('click', fn) 改写成 pointerup，那条路径
+      // 不受影响；但 <button onclick="..."> 这种内联 onclick 在 file:// 下失灵。
+      // 这里在 HTML 字符串里 inline 一段脚本，pointerup capture 时顺着 DOM 向上
+      // 找 onclick 属性并直接 .call() 调用，绕开 dispatchEvent 的黑洞。
+      // 脚本作为 iframe 自身脚本运行，不依赖父 frame 跨域访问子 document。
+      return [
+        '<script data-sekai-local-click-compat="1">',
+        '(function(){',
+        'if(window.__sekai_local_click_compat_installed)return;',
+        'window.__sekai_local_click_compat_installed=true;',
+        'var TAP_SLOP=12;',
+        'var DEDUPE_MS=600;',
+        'var down=null;',
+        // 记录最近一次 compat 兜底触发 onclick 的 target + 时间，用于去重
+        // 个别设备上原生 click 仍能触达 onclick 属性 —— 避免双触发。
+        'var lastCompatFire=null;',
+        'function isPrimaryButton(e){return e.button===undefined||e.button===0;}',
+        'function reset(pointerId){if(!down)return;if(pointerId!==undefined&&down.pointerId!==undefined&&pointerId!==down.pointerId)return;down=null;}',
+        'function isTap(e){if(!down)return false;var dx=Math.abs((e.clientX||0)-down.x);var dy=Math.abs((e.clientY||0)-down.y);return dx<=TAP_SLOP&&dy<=TAP_SLOP;}',
+        'function onclickInPath(node){while(node&&node!==document&&node!==window){if(typeof node.onclick===\'function\')return node;node=node.parentElement;}return null;}',
+        'function buildCompatEvent(e){try{return new MouseEvent(\'click\',{bubbles:true,cancelable:true,view:e.view||window,detail:1,screenX:e.screenX||0,screenY:e.screenY||0,clientX:e.clientX||0,clientY:e.clientY||0,ctrlKey:!!e.ctrlKey,altKey:!!e.altKey,shiftKey:!!e.shiftKey,metaKey:!!e.metaKey,button:0,relatedTarget:null});}catch(_){return e;}}',
+        'function callOnclickPath(node,e){var fired=0;while(node&&node!==document&&node!==window){if(typeof node.onclick===\'function\'){try{var r=node.onclick.call(node,e);fired++;if(r===false&&e&&e.preventDefault)e.preventDefault();}catch(_err){}if(e&&e.cancelBubble)break;}node=node.parentElement;}return fired;}',
+        'window.addEventListener(\'pointerdown\',function(e){if(!isPrimaryButton(e))return;down={x:e.clientX||0,y:e.clientY||0,pointerId:e.pointerId,target:e.target};},true);',
+        'window.addEventListener(\'pointercancel\',function(e){reset(e.pointerId);},true);',
+        'window.addEventListener(\'pointerup\',function(e){if(!isPrimaryButton(e)||!down)return;if(down.pointerId!==undefined&&e.pointerId!==undefined&&down.pointerId!==e.pointerId)return;var target=e.target&&e.target.nodeType===1?e.target:down.target;var tap=isTap(e);var root=target?onclickInPath(target):null;down=null;if(!target||!tap||!root)return;var compatEvent=buildCompatEvent(e);setTimeout(function(){var fired=callOnclickPath(target,compatEvent);if(fired>0){lastCompatFire={root:root,t:Date.now()};}},0);},true);',
+        // Dedupe: 若最近 compat 已触发过，吞掉原生 click 对同路径 onclick 的重复调用
+        'window.addEventListener(\'click\',function(e){if(!lastCompatFire)return;if(Date.now()-lastCompatFire.t>DEDUPE_MS){lastCompatFire=null;return;}var n=e.target;while(n&&n!==document&&n!==window){if(n===lastCompatFire.root){lastCompatFire=null;e.stopImmediatePropagation();return;}n=n.parentElement;}},true);',
+        '})();',
+        '<\/script>',
+      ].join('');
+    }
+
+    function injectLocalClickCompatInline(html) {
+      // 这段脚本必须躲开 injectScripts() 里的双注入防护（SEKAI_SYNTHETIC_KEY
+      // 等特征命中就整段 skip），所以独立 inline 一次。幂等靠脚本内的
+      // __sekai_local_click_compat_installed 保证。
+      if (!html) return html;
+      if (html.indexOf('data-sekai-local-click-compat') !== -1) return html;
+      var tag = buildLocalClickCompatScriptTag();
+      var headMatch = html.match(/<head[^>]*>/i);
+      if (headMatch) {
+        var insertPos = (headMatch.index || 0) + headMatch[0].length;
+        return html.slice(0, insertPos) + tag + html.slice(insertPos);
+      }
+      var htmlMatch = html.match(/<html[^>]*>/i);
+      if (htmlMatch) {
+        var htmlPos = (htmlMatch.index || 0) + htmlMatch[0].length;
+        return html.slice(0, htmlPos) + '<head>' + tag + '</head>' + html.slice(htmlPos);
+      }
+      return tag + html;
+    }
+
+    function buildMissingLibraryCompatScriptTag() {
+      return [
+        '<script data-sekai-missing-library-compat="1">',
+        '(function(){',
+        'if(!window.lucide){window.lucide={createIcons:function(){}};}',
+        '})();',
+        '<\/script>',
+      ].join('');
+    }
+
+    function injectMissingLibraryCompatInline(html) {
+      if (!html) return html;
+      if (html.indexOf('lucide') === -1) return html;
+      if (html.indexOf('data-sekai-missing-library-compat') !== -1) return html;
+      var tag = buildMissingLibraryCompatScriptTag();
+      var headMatch = html.match(/<head[^>]*>/i);
+      if (headMatch) {
+        var insertPos = (headMatch.index || 0) + headMatch[0].length;
+        return html.slice(0, insertPos) + tag + html.slice(insertPos);
+      }
+      var htmlMatch = html.match(/<html[^>]*>/i);
+      if (htmlMatch) {
+        var htmlPos = (htmlMatch.index || 0) + htmlMatch[0].length;
+        return html.slice(0, htmlPos) + '<head>' + tag + '</head>' + html.slice(htmlPos);
+      }
+      return tag + html;
+    }
+
+    function buildIframeDiagnosticsScriptTag() {
+      return [
+        '<script data-sekai-iframe-diagnostics="1">',
+        '(function(){',
+        'if(window.__sekai_iframe_diag_installed)return;',
+        'window.__sekai_iframe_diag_installed=true;',
+        'function post(type,payload){try{window.parent.postMessage(Object.assign({type:type},payload||{}),\'*\');}catch(_){}}',
+        'function now(){try{return window.performance&&performance.now?performance.now():Date.now();}catch(_){return Date.now();}}',
+        'function safe(a){try{if(a===undefined)return\'undefined\';if(a===null)return\'null\';if(typeof a===\'string\')return a;if(typeof a===\'number\'||typeof a===\'boolean\')return String(a);if(a instanceof Error)return a.name+\': \'+a.message+(a.stack?\'\\n\'+a.stack:\'\');return JSON.stringify(a);}catch(_){return\'<unserializable>\';}}',
+        'function hook(level){var orig=console[level];if(typeof orig!==\'function\')return;console[level]=function(){var args=[];for(var i=0;i<arguments.length;i++)args.push(safe(arguments[i]));post(\'sekai_iframe_console\',{level:level,line:args.join(\' \')});try{orig.apply(console,arguments);}catch(_){}};}',
+        '[\'log\',\'info\',\'warn\',\'error\',\'debug\'].forEach(hook);',
+        'function vp(){try{var de=document.documentElement,b=document.body,vv=window.visualViewport;return{ih:window.innerHeight,iw:window.innerWidth,deCH:de&&de.clientHeight,deCW:de&&de.clientWidth,boH:b&&b.offsetHeight,boW:b&&b.offsetWidth,sh:window.screen&&screen.height,sw:window.screen&&screen.width,vvH:vv&&vv.height,vvW:vv&&vv.width,rs:document.readyState};}catch(e){return{err:String(e)}}}',
+        'function pp(tag,extra){post(\'sekai_iframe_perf_trace\',{tag:tag,ts:now(),extra:extra||null});}',
+        'pp(\'diag:installed\',vp());',
+        'document.addEventListener(\'readystatechange\',function(){pp(\'diag:readystate\',{state:document.readyState,vp:vp()});});',
+        'window.addEventListener(\'message\',function(e){if(!(e.data&&e.data.type===\'viewport_height_change\'))return;var before=vp();setTimeout(function(){pp(\'diag:viewport_msg\',{h:e.data.height,before:before,after:vp()});},0);});',
+        'window.addEventListener(\'DOMContentLoaded\',function(){pp(\'diag:DCL\',vp());try{var cs=document.querySelectorAll(\'canvas\');for(var i=0;i<cs.length;i++){var c=cs[i],r=c.getBoundingClientRect();pp(\'diag:canvas\',{i:i,id:c.id||\'\',cls:c.className||\'\',w:c.width,h:c.height,sw:Math.round(r.width),sh:Math.round(r.height),sl:Math.round(r.left),st:Math.round(r.top)});}pp(\'diag:DCL:scan\',{canvas:cs.length});}catch(e){pp(\'diag:canvas:error\',{err:String(e)});}});',
+        'window.addEventListener(\'load\',function(){pp(\'diag:window.load\',vp());});',
+        '})();',
+        '<\/script>',
+      ].join('');
+    }
+
+    function injectIframeDiagnosticsInline(html) {
+      if (!html) return html;
+      if (html.indexOf('data-sekai-iframe-diagnostics') !== -1) return html;
+      var tag = buildIframeDiagnosticsScriptTag();
+      var headMatch = html.match(/<head[^>]*>/i);
+      if (headMatch) {
+        var insertPos = (headMatch.index || 0) + headMatch[0].length;
+        return html.slice(0, insertPos) + tag + html.slice(insertPos);
+      }
+      var htmlMatch = html.match(/<html[^>]*>/i);
+      if (htmlMatch) {
+        var htmlPos = (htmlMatch.index || 0) + htmlMatch[0].length;
+        return html.slice(0, htmlPos) + '<head>' + tag + '</head>' + html.slice(htmlPos);
+      }
+      return tag + html;
+    }
+
+    function isHairCanvasGameHtml(html) {
+      return html &&
+        html.indexOf('id="game-canvas"') !== -1 &&
+        html.indexOf('function initHair') !== -1 &&
+        html.indexOf('function initApp') !== -1 &&
+        html.indexOf('window.appState.hair') !== -1;
+    }
+
+    function buildHairCanvasInitGuardScriptTag() {
+      return [
+        '<script data-sekai-hair-init-guard="1">',
+        '(function(){',
+        'if(window.__sekai_hair_init_guard_installed)return;',
+        'window.__sekai_hair_init_guard_installed=true;',
+        'var hooked=false,ran=false;',
+        'function post(tag,extra){try{window.parent.postMessage({type:\'sekai_iframe_perf_trace\',tag:tag,ts:(performance&&performance.now)?performance.now():Date.now(),extra:extra||null},\'*\');}catch(_){}}',
+        'function dims(){var de=document.documentElement,b=document.body,c=document.getElementById(\'game-canvas\'),r=c&&c.getBoundingClientRect?c.getBoundingClientRect():null;return{iw:window.innerWidth||0,ih:window.innerHeight||0,deW:de&&de.clientWidth||0,deH:de&&de.clientHeight||0,boW:b&&b.offsetWidth||0,boH:b&&b.offsetHeight||0,cw:c&&c.width||0,ch:c&&c.height||0,crw:r&&Math.round(r.width)||0,crh:r&&Math.round(r.height)||0,rs:document.readyState};}',
+        'function usable(d){d=d||dims();return d.iw>0&&d.ih>0&&d.deW>0&&d.deH>0;}',
+        'function raf(fn){if(typeof requestAnimationFrame===\'function\')requestAnimationFrame(fn);else setTimeout(fn,16);}',
+        'function waitStable(done){var tries=0,last=null;function step(){var d=dims();if(usable(d)&&last&&last.iw===d.iw&&last.ih===d.ih&&last.deW===d.deW&&last.deH===d.deH){post(\'hair_guard:ready\',{tries:tries,dims:d});done();return;}last=d;tries++;if(tries>120){post(\'hair_guard:timeout\',{tries:tries,dims:d});done();return;}raf(step);}raf(step);}',
+        'var add=document.addEventListener;',
+        'document.addEventListener=function(type,listener,options){',
+          'if(type===\'DOMContentLoaded\'&&typeof listener===\'function\'&&listener.name===\'initApp\'){',
+            'hooked=true;',
+            'var wrapped=function(event){',
+              'var d=dims();',
+              'if(usable(d)){post(\'hair_guard:init_now\',{dims:d});ran=true;return listener.call(this,event);}',
+              'post(\'hair_guard:init_deferred\',{dims:d});',
+              'waitStable(function(){if(ran)return;ran=true;listener.call(document,event);});',
+            '};',
+            'return add.call(this,type,wrapped,options);',
+          '}',
+          'return add.call(this,type,listener,options);',
+        '};',
+        'add.call(document,\'DOMContentLoaded\',function(){',
+          'post(\'hair_guard:DCL\',{hooked:hooked,ran:ran,dims:dims()});',
+          'if(hooked)return;',
+          'var d=dims();',
+          'if(usable(d))return;',
+          'waitStable(function(){if(typeof window.resize===\'function\')try{window.resize();}catch(_){}if(typeof window.initHair===\'function\')try{window.initHair();post(\'hair_guard:reinit\',{dims:dims()});}catch(e){post(\'hair_guard:reinit_error\',{err:String(e)});}});',
+        '});',
+        '})();',
+        '<\/script>',
+      ].join('');
+    }
+
+    function injectHairCanvasInitGuardInline(html) {
+      if (!isHairCanvasGameHtml(html)) return html;
+      if (html.indexOf('data-sekai-hair-init-guard') !== -1) return html;
+      var tag = buildHairCanvasInitGuardScriptTag();
+      var headMatch = html.match(/<head[^>]*>/i);
+      if (headMatch) {
+        var insertPos = (headMatch.index || 0) + headMatch[0].length;
+        return html.slice(0, insertPos) + tag + html.slice(insertPos);
+      }
+      return tag + html;
+    }
+
+    function buildViewportBridgePreludeScriptTag() {
+      // 与 buildInjectedScripts() 中的 viewport bridge 段语义对齐，但独立
+      // inline、内置 __sekai_viewport_bridge_installed 守门，保证可与全量
+      // 注入路径互斥共存：先到先得，第二份 return。
+      // ── 临时附加 perf_trace（验证完删除）：在 prelude 末尾注册
+      // PerformanceObserver(resource) + readystatechange + DCL/load 监听，
+      // 把每个外部资源 url+duration 和 DOM 阶段切换时刻 postMessage 给父
+      // shell，定位 viewport_ready → dom_ready 之间的具体瓶颈。
+      return [
+        '<script data-sekai-viewport-bridge="1">',
+        '(function(){',
+        'if(window.__sekai_viewport_bridge_installed)return;',
+        'window.__sekai_viewport_bridge_installed=true;',
+        'var vs=document.createElement(\'style\');vs.id=\'sekai-viewport-style\';',
+        'function attach(){if(document.head&&!vs.parentNode)document.head.appendChild(vs);}',
+        'attach();if(!vs.parentNode){document.addEventListener(\'DOMContentLoaded\',attach);}',
+        'try{Object.defineProperty(window,\'innerHeight\',{get:function(){return document.documentElement.clientHeight},configurable:true})}catch(_){}',
+        // cur 用 false 当"从未 apply 过"哨兵；shell 在键盘未弹时发的 height
+        // 就是 null，若 cur 初始也是 null 则 first apply(null) 早返回，
+        // html/body{height:100%!important} 永远写不进去，game DCL 时
+        // documentElement.clientHeight 拿到 0/瞬态值 → 头发挤边。
+        'var cur=false;',
+        'function apply(h){',
+          'if(h===cur)return;cur=h;attach();',
+          'if(typeof h===\'number\'&&h>0){',
+            'vs.textContent=\':root{--sekai-viewport-height:\'+h+\'px}html{height:\'+h+\'px!important;overflow:hidden!important}body{height:\'+h+\'px!important;overflow:hidden!important}#game-container{height:\'+h+\'px!important}\';',
+          '}else{',
+            'vs.textContent=\':root{--sekai-viewport-height:100%}html{height:100%!important;overflow:hidden!important}body{height:100%!important;overflow:hidden!important}\';',
+          '}',
+        '}',
+        'var _dk=(function(){var d=document.documentElement;return d?(d.clientWidth+\"x\"+d.clientHeight):\"\";})();',
+        'window.addEventListener(\'message\',function(e){',
+          'if(e.data&&e.data.type===\'viewport_height_change\'){',
+            'apply(typeof e.data.height===\'number\'?e.data.height:null);',
+            'var d=document.documentElement;var nk=d?(d.clientWidth+\"x\"+d.clientHeight):\"\";',
+            'if(nk!==_dk){_dk=nk;try{window.dispatchEvent(new Event(\'resize\'))}catch(_){}}',
+          '}',
+        '});',
+        'try{window.parent.postMessage({type:\'viewport_ready\'},\'*\')}catch(_){}',
+        // ── 跨源 console 穿透 ─────────────────────────────────────────
+        // game iframe 是 blob:null 跨源，原生 onConsoleMessage 抓不到。
+        // hook console.* 后 postMessage 给 game_frame，game_frame 默认 forward
+        // 给 shell，shell 主动 console.log 一份，最终被 InAppWebView 捕获。
+        'function _safeArg(a){try{if(a===undefined)return\'undefined\';if(a===null)return\'null\';if(typeof a===\'string\')return a;if(typeof a===\'number\'||typeof a===\'boolean\')return String(a);if(a instanceof Error)return a.name+\': \'+a.message+(a.stack?\'\\n\'+a.stack:\'\');return JSON.stringify(a);}catch(_){return\'<unserializable>\';}}',
+        'function _hookOne(level){var orig=console[level];if(typeof orig!==\'function\')return;console[level]=function(){var args=new Array(arguments.length);for(var i=0;i<arguments.length;i++)args[i]=_safeArg(arguments[i]);try{window.parent.postMessage({type:\'sekai_iframe_console\',level:level,line:args.join(\' \')},\'*\');}catch(_){}try{orig.apply(console,arguments);}catch(_){}};}',
+        '[\'log\',\'info\',\'warn\',\'error\',\'debug\'].forEach(_hookOne);',
+        // ── perf_trace + 样式诊断打点 ────────────────────────────────
+        'function pp(tag,extra){try{window.parent.postMessage({type:\'sekai_iframe_perf_trace\',tag:tag,ts:(performance&&performance.now)?performance.now():Date.now(),extra:extra||null},\'*\');}catch(_){}}',
+        // dump 当前 viewport 全维度——定位"DCL 时拿到什么尺寸"。
+        'function _vp(){try{var de=document.documentElement,b=document.body,vv=window.visualViewport;return{ih:window.innerHeight,iw:window.innerWidth,deCH:de&&de.clientHeight,deCW:de&&de.clientWidth,boH:b&&b.offsetHeight,boW:b&&b.offsetWidth,sh:screen&&screen.height,sw:screen&&screen.width,vvH:vv&&vv.height,vvW:vv&&vv.width,cur:cur,rs:document.readyState};}catch(_){return{err:String(_)};}}',
+        'pp(\'prelude:installed\',_vp());',
+        'document.addEventListener(\'readystatechange\',function(){pp(\'readystate\',{state:document.readyState});});',
+        'window.addEventListener(\'DOMContentLoaded\',function(){',
+          'pp(\'DCL\',_vp());',
+          // 把 DCL 时刻所有 canvas 的尺寸 dump 一遍——hair 粒子在哪个 canvas
+          // 上、用什么坐标系初始化的，一眼看见。
+          'try{var cs=document.querySelectorAll(\'canvas\');for(var i=0;i<cs.length;i++){var c=cs[i],r=c.getBoundingClientRect();pp(\'canvas\',{i:i,id:c.id||\'\',cls:c.className||\'\',w:c.width,h:c.height,sw:Math.round(r.width),sh:Math.round(r.height),sl:Math.round(r.left),st:Math.round(r.top)});}pp(\'DCL:scan\',{canvas:cs.length});}catch(_){}',
+        '});',
+        'window.addEventListener(\'load\',function(){pp(\'window.load\',_vp());});',
+        // apply() 每次调用 dump 状态，定位"哨兵 bug 是否真修了 + 写 CSS 后 clientHeight 变没变"。
+        'var _origApply=apply;apply=function(h){var before=_vp();var ret=_origApply(h);try{var after=_vp();pp(\'apply\',{h:h,before_cur:before.cur,after_cur:after.cur,before_deCH:before.deCH,after_deCH:after.deCH});}catch(_){}return ret;};',
+        'try{',
+          'var seen={};',
+          'var po=new PerformanceObserver(function(list){',
+            'var es=list.getEntries();',
+            'for(var i=0;i<es.length;i++){',
+              'var e=es[i];',
+              'if(seen[e.name])continue;seen[e.name]=true;',
+              'pp(\'res\',{type:e.initiatorType||\'?\',url:e.name,dur:Math.round(e.duration||0),size:e.transferSize||0,start:Math.round(e.startTime||0)});',
+            '}',
+          '});',
+          'po.observe({type:\'resource\',buffered:true});',
+        '}catch(_){}',
+        // ── freeze / thaw hook （2026-05-06 新增）────────────────────────
+        // shell 从 display:none 迁为 visibility:hidden + sekai:freeze 协议后，
+        // 浏览器不再自动冻结 rAF。这里拦截全局 rAF：frozen 时不排队，
+        // freeze 时还会 cancel 所有 pending frame；sekai:thaw 后恢复。
+        // AudioContext 在需要时同时 suspend / resume（hook 构造器记录所有实例）。
+        // game 可依需提供 window.__sekaiOnFreeze / window.__sekaiOnThaw 钩子。
+        'try{',
+          'if(window.__sekai_runtime_lifecycle_installed)return;window.__sekai_runtime_lifecycle_installed=true;',
+          'var _frozen=false,_rafIds=[],_rafMap={},_frozenRafFns=[],_timerSeq=1,_timeouts={},_intervals={},_mediaResume=[];',
+          'window.__sekaiRuntimeFrozen=false;',
+          'window.__sekaiIsRuntimeFrozen=function(){return _frozen;};',
+          'var _origRAF=window.requestAnimationFrame;',
+          'var _origCAF=window.cancelAnimationFrame;',
+          'if(_origRAF&&_origCAF){',
+            'window.requestAnimationFrame=function(fn){',
+              'if(_frozen){_frozenRafFns.push(fn);pp("raf:frozen_push",{cnt:_frozenRafFns.length});return -1;}',
+              'var id;var w=function(ts){var idx=_rafIds.indexOf(id);if(idx>=0)_rafIds.splice(idx,1);delete _rafMap[id];fn(ts);};id=_origRAF.call(window,w);_rafIds.push(id);_rafMap[id]=fn;return id;',
+            '};',
+            'window.cancelAnimationFrame=function(id){',
+              'var i=_rafIds.indexOf(id);if(i>=0)_rafIds.splice(i,1);delete _rafMap[id];',
+              '_origCAF.call(window,id);',
+            '};',
+          '}',
+          'pp("raf_hook:installed",{frozen:_frozen,hasRAF:!!_origRAF,hasCAF:!!_origCAF});',
+          'var _origST=window.setTimeout,_origCT=window.clearTimeout,_origSI=window.setInterval,_origCI=window.clearInterval;',
+          'function _timerCall(fn,args){try{if(typeof fn==="function")fn.apply(window,args||[]);else _origST(fn,0);}catch(e){_origST(function(){throw e;},0);}}',
+          'function _armTimeout(id,delay){var t=_timeouts[id];if(!t)return;t.nativeId=_origST(function(){var cur=_timeouts[id];if(!cur)return;if(_frozen){cur.nativeId=null;cur.due=true;return;}delete _timeouts[id];_timerCall(cur.fn,cur.args);},delay||0);}',
+          'function _armInterval(id){var it=_intervals[id];if(!it)return;it.nativeId=_origSI(function(){if(_frozen)return;_timerCall(it.fn,it.args);},it.delay||0);}',
+          'if(_origST&&_origCT){window.setTimeout=function(fn,delay){var id=_timerSeq++,args=Array.prototype.slice.call(arguments,2);_timeouts[id]={fn:fn,args:args,nativeId:null,due:false};_armTimeout(id,delay);return id;};window.clearTimeout=function(id){var t=_timeouts[id];if(t&&t.nativeId!=null)_origCT(t.nativeId);delete _timeouts[id];};}',
+          'if(_origSI&&_origCI){window.setInterval=function(fn,delay){var id=_timerSeq++,args=Array.prototype.slice.call(arguments,2);_intervals[id]={fn:fn,args:args,delay:delay||0,nativeId:null};_armInterval(id);return id;};window.clearInterval=function(id){var it=_intervals[id];if(it&&it.nativeId!=null)_origCI(it.nativeId);delete _intervals[id];};}',
+          'var _origMediaPlay=window.HTMLMediaElement&&HTMLMediaElement.prototype.play;',
+          'if(_origMediaPlay){HTMLMediaElement.prototype.play=function(){if(_frozen){if(_mediaResume.indexOf(this)<0)_mediaResume.push(this);return Promise.resolve();}return _origMediaPlay.apply(this,arguments);};}',
+          'var _audioCtxs=[];',
+          'var _OrigAC=window.AudioContext||window.webkitAudioContext;',
+          'if(_OrigAC){',
+            // wrapper 函数：JS 里 new 带 return object 的函数会返回那个 object，
+            // 联合 _NewAC.prototype = _OrigAC.prototype 让 instanceof 仍然合词。
+            'function _NewAC(opts){var c=arguments.length?new _OrigAC(opts):new _OrigAC();_audioCtxs.push(c);if(_frozen)c.suspend().catch(function(){});return c;}',
+            '_NewAC.prototype=_OrigAC.prototype;',
+            'try{window.AudioContext=_NewAC;}catch(_e1){}',
+            'try{if(window.webkitAudioContext)window.webkitAudioContext=_NewAC;}catch(_e2){}',
+          '}',
+          'window.addEventListener(\'message\',function(e){',
+            'if(!e||!e.data)return;',
+            'var t=e.data.type;',
+            'if(t===\'sekai:freeze\'){',
+              'if(_frozen)return;_frozen=true;window.__sekaiRuntimeFrozen=true;',
+              'var ids=[];try{ids=_rafIds.slice();_rafIds.length=0;for(var i=0;i<ids.length;i++){if(_rafMap[ids[i]])_frozenRafFns.push(_rafMap[ids[i]]);delete _rafMap[ids[i]];_origCAF.call(window,ids[i]);}}catch(_e3){}',
+              'var timeoutPaused=0;try{for(var tid in _timeouts){var tt=_timeouts[tid];if(tt&&tt.nativeId!=null){_origCT(tt.nativeId);tt.nativeId=null;tt.due=true;timeoutPaused++;}}}catch(_e4){}',
+              'var intervalPaused=0;try{for(var iid in _intervals){var ii=_intervals[iid];if(ii&&ii.nativeId!=null){_origCI(ii.nativeId);ii.nativeId=null;intervalPaused++;}}}catch(_e5){}',
+              'var mediaPaused=0;try{_mediaResume=[];var ms=document.querySelectorAll("audio,video");for(var m=0;m<ms.length;m++){var el=ms[m];if(el&&!el.paused&&!el.ended&&_mediaResume.indexOf(el)<0)_mediaResume.push(el);try{el.pause();mediaPaused++;}catch(_em){}}}catch(_e6){}',
+              'try{for(var j=0;j<_audioCtxs.length;j++){var c=_audioCtxs[j];if(c&&c.state===\'running\')c.suspend().catch(function(){});}}catch(_e7){}',
+
+              'try{if(typeof window.__sekaiOnFreeze===\'function\')window.__sekaiOnFreeze();}catch(_e8){}',
+              'try{(typeof pp==="function"?pp:_pp)("raf:freeze_done",{rafSaved:_frozenRafFns.length});}catch(_eflog){}',
+            '}else if(t===\'sekai:thaw\'){',
+              'if(!_frozen)return;_frozen=false;window.__sekaiRuntimeFrozen=false;',
+              'var _thawRafCnt=_frozenRafFns.length;try{var _thawRafFns=_frozenRafFns.splice(0);for(var _ri=0;_ri<_thawRafFns.length;_ri++)window.requestAnimationFrame(_thawRafFns[_ri]);}catch(_eRaf){}',
+              'try{(typeof pp==="function"?pp:_pp)("raf:thaw_done",{restored:_thawRafCnt});}catch(_etlog){}',
+              'var timeoutResumed=0;try{for(var tid2 in _timeouts){var tt2=_timeouts[tid2];if(tt2&&tt2.nativeId==null){tt2.due=false;_armTimeout(tid2,0);timeoutResumed++;}}}catch(_e9){}',
+              'var intervalResumed=0;try{for(var iid2 in _intervals){var ii2=_intervals[iid2];if(ii2&&ii2.nativeId==null){_armInterval(iid2);intervalResumed++;}}}catch(_e10){}',
+              'try{for(var k=0;k<_audioCtxs.length;k++){var c2=_audioCtxs[k];if(c2&&c2.state===\'suspended\')c2.resume().catch(function(){});}}catch(_e11){}',
+              'var mediaResumed=0;try{var rs=_mediaResume.slice();_mediaResume.length=0;for(var r=0;r<rs.length;r++){if(rs[r]&&rs[r].paused){rs[r].play().catch(function(){});mediaResumed++;}}}catch(_e12){}',
+
+              'try{if(typeof window.__sekaiOnThaw===\'function\')window.__sekaiOnThaw();}catch(_e13){}',
+            '}',
+          '});',
+        '}catch(_e){try{pp(\'freeze:install_error\',{err:String(_e)});}catch(_){};}',
+        // ─────────────────────────────────────────────────────────
+        '})();',
+        '<\/script>',
+      ].join('');
+    }
+
+    function buildRuntimeLifecyclePreludeScriptTag() {
+      return [
+        '<script data-sekai-runtime-lifecycle="1">',
+        '(function(){',
+        'try{',
+          'if(window.__sekai_runtime_lifecycle_installed)return;window.__sekai_runtime_lifecycle_installed=true;',
+          'var _frozen=false,_rafIds=[],_rafMap={},_frozenRafFns=[],_timerSeq=1,_timeouts={},_intervals={},_mediaResume=[];',
+          'function _pp(t,x){try{window.parent.postMessage({type:"sekai_iframe_perf_trace",tag:t,ts:performance&&performance.now?performance.now():Date.now(),extra:x||null},"*");}catch(_){}}',
+          'window.__sekaiRuntimeFrozen=false;',
+          'window.__sekaiIsRuntimeFrozen=function(){return _frozen;};',
+          'var _origRAF=window.requestAnimationFrame;',
+          'var _origCAF=window.cancelAnimationFrame;',
+          'if(_origRAF&&_origCAF){',
+            'window.requestAnimationFrame=function(fn){if(_frozen){_frozenRafFns.push(fn);_pp("raf:frozen_push",{cnt:_frozenRafFns.length});return -1;}var id;var w=function(ts){var idx=_rafIds.indexOf(id);if(idx>=0)_rafIds.splice(idx,1);delete _rafMap[id];fn(ts);};id=_origRAF.call(window,w);_rafIds.push(id);_rafMap[id]=fn;return id;};',
+            'window.cancelAnimationFrame=function(id){var i=_rafIds.indexOf(id);if(i>=0)_rafIds.splice(i,1);delete _rafMap[id];_origCAF.call(window,id);};',
+          '}',
+          '_pp("raf_hook:installed",{frozen:_frozen,hasRAF:!!_origRAF,hasCAF:!!_origCAF});',
+          'var _origST=window.setTimeout,_origCT=window.clearTimeout,_origSI=window.setInterval,_origCI=window.clearInterval;',
+          'function _timerCall(fn,args){try{if(typeof fn==="function")fn.apply(window,args||[]);else _origST(fn,0);}catch(e){_origST(function(){throw e;},0);}}',
+          'function _armTimeout(id,delay){var t=_timeouts[id];if(!t)return;t.nativeId=_origST(function(){var cur=_timeouts[id];if(!cur)return;if(_frozen){cur.nativeId=null;cur.due=true;return;}delete _timeouts[id];_timerCall(cur.fn,cur.args);},delay||0);}',
+          'function _armInterval(id){var it=_intervals[id];if(!it)return;it.nativeId=_origSI(function(){if(_frozen)return;_timerCall(it.fn,it.args);},it.delay||0);}',
+          'if(_origST&&_origCT){window.setTimeout=function(fn,delay){var id=_timerSeq++,args=Array.prototype.slice.call(arguments,2);_timeouts[id]={fn:fn,args:args,nativeId:null,due:false};_armTimeout(id,delay);return id;};window.clearTimeout=function(id){var t=_timeouts[id];if(t&&t.nativeId!=null)_origCT(t.nativeId);delete _timeouts[id];};}',
+          'if(_origSI&&_origCI){window.setInterval=function(fn,delay){var id=_timerSeq++,args=Array.prototype.slice.call(arguments,2);_intervals[id]={fn:fn,args:args,delay:delay||0,nativeId:null};_armInterval(id);return id;};window.clearInterval=function(id){var it=_intervals[id];if(it&&it.nativeId!=null)_origCI(it.nativeId);delete _intervals[id];};}',
+          'var _origMediaPlay=window.HTMLMediaElement&&HTMLMediaElement.prototype.play;',
+          'if(_origMediaPlay){HTMLMediaElement.prototype.play=function(){if(_frozen){if(_mediaResume.indexOf(this)<0)_mediaResume.push(this);return Promise.resolve();}return _origMediaPlay.apply(this,arguments);};}',
+          'var _audioCtxs=[];',
+          'var _OrigAC=window.AudioContext||window.webkitAudioContext;',
+          'if(_OrigAC){',
+            'function _NewAC(opts){var c=arguments.length?new _OrigAC(opts):new _OrigAC();_audioCtxs.push(c);if(_frozen)c.suspend().catch(function(){});return c;}',
+            '_NewAC.prototype=_OrigAC.prototype;',
+            'try{window.AudioContext=_NewAC;}catch(_e1){}',
+            'try{if(window.webkitAudioContext)window.webkitAudioContext=_NewAC;}catch(_e2){}',
+          '}',
+          'window.addEventListener(\'message\',function(e){',
+            'if(!e||!e.data)return;',
+            'var t=e.data.type;',
+            'if(t===\'sekai:freeze\'){',
+              'if(_frozen)return;_frozen=true;window.__sekaiRuntimeFrozen=true;',
+              'var ids=[];try{ids=_rafIds.slice();_rafIds.length=0;for(var i=0;i<ids.length;i++){if(_rafMap[ids[i]])_frozenRafFns.push(_rafMap[ids[i]]);delete _rafMap[ids[i]];_origCAF.call(window,ids[i]);}}catch(_e3){}',
+              'var timeoutPaused=0;try{for(var tid in _timeouts){var tt=_timeouts[tid];if(tt&&tt.nativeId!=null){_origCT(tt.nativeId);tt.nativeId=null;tt.due=true;timeoutPaused++;}}}catch(_e4){}',
+              'var intervalPaused=0;try{for(var iid in _intervals){var ii=_intervals[iid];if(ii&&ii.nativeId!=null){_origCI(ii.nativeId);ii.nativeId=null;intervalPaused++;}}}catch(_e5){}',
+              'var mediaPaused=0;try{_mediaResume=[];var ms=document.querySelectorAll("audio,video");for(var m=0;m<ms.length;m++){var el=ms[m];if(el&&!el.paused&&!el.ended&&_mediaResume.indexOf(el)<0)_mediaResume.push(el);try{el.pause();mediaPaused++;}catch(_em){}}}catch(_e6){}',
+              'try{for(var j=0;j<_audioCtxs.length;j++){var c=_audioCtxs[j];if(c&&c.state===\'running\')c.suspend().catch(function(){});}}catch(_e7){}',
+
+              'try{if(typeof window.__sekaiOnFreeze===\'function\')window.__sekaiOnFreeze();}catch(_e8){}',
+              'try{(typeof pp==="function"?pp:_pp)("raf:freeze_done",{rafSaved:_frozenRafFns.length});}catch(_eflog){}',
+            '}else if(t===\'sekai:thaw\'){',
+              'if(!_frozen)return;_frozen=false;window.__sekaiRuntimeFrozen=false;',
+              'var _thawRafCnt=_frozenRafFns.length;try{var _thawRafFns=_frozenRafFns.splice(0);for(var _ri=0;_ri<_thawRafFns.length;_ri++)window.requestAnimationFrame(_thawRafFns[_ri]);}catch(_eRaf){}',
+              'try{_pp("raf:thaw_done",{restored:_thawRafCnt});}catch(_etlog){}',
+              'var timeoutResumed=0;try{for(var tid2 in _timeouts){var tt2=_timeouts[tid2];if(tt2&&tt2.nativeId==null){tt2.due=false;_armTimeout(tid2,0);timeoutResumed++;}}}catch(_e9){}',
+              'var intervalResumed=0;try{for(var iid2 in _intervals){var ii2=_intervals[iid2];if(ii2&&ii2.nativeId==null){_armInterval(iid2);intervalResumed++;}}}catch(_e10){}',
+              'try{for(var k=0;k<_audioCtxs.length;k++){var c2=_audioCtxs[k];if(c2&&c2.state===\'suspended\')c2.resume().catch(function(){});}}catch(_e11){}',
+              'var mediaResumed=0;try{var rs=_mediaResume.slice();_mediaResume.length=0;for(var r=0;r<rs.length;r++){if(rs[r]&&rs[r].paused){rs[r].play().catch(function(){});mediaResumed++;}}}catch(_e12){}',
+
+              'try{if(typeof window.__sekaiOnThaw===\'function\')window.__sekaiOnThaw();}catch(_e13){}',
+            '}',
+          '});',
+        '}catch(_e){}',
+        '})();',
+        '<\/script>',
+      ].join('');
+    }
+
+    function injectRuntimeLifecyclePreludeInline(html) {
+      if (!html) return html;
+      if (html.indexOf('data-sekai-runtime-lifecycle') !== -1) return html;
+      if (html.indexOf('__sekai_runtime_lifecycle_installed') !== -1) return html;
+      var tag = buildRuntimeLifecyclePreludeScriptTag();
+      var headMatch = html.match(/<head[^>]*>/i);
+      if (headMatch) {
+        var insertPos = (headMatch.index || 0) + headMatch[0].length;
+        return html.slice(0, insertPos) + tag + html.slice(insertPos);
+      }
+      var htmlMatch = html.match(/<html[^>]*>/i);
+      if (htmlMatch) {
+        var htmlPos = (htmlMatch.index || 0) + htmlMatch[0].length;
+        return html.slice(0, htmlPos) + '<head>' + tag + '</head>' + html.slice(htmlPos);
+      }
+      return tag + html;
+    }
+
+    function buildMiniAppInteractionScriptTag() {
+      return [
+        '<script data-sekai-mini-app-interaction="1">',
+        '(function(){',
+        'try{',
+          'if(window.__sekai_mini_app_interaction_installed)return;',
+          'window.__sekai_mini_app_interaction_installed=true;',
+          'var opts={passive:true,capture:true};',
+          'function notify(){try{window.parent.postMessage({type:\'sekai:mini_app_interacted\'},\'*\');}catch(_){}}',
+          'document.addEventListener(\'pointerdown\',notify,opts);',
+        '}catch(_e){}',
+        '})();',
+        '<\/script>',
+      ].join('');
+    }
+
+    function injectMiniAppInteractionInline(html) {
+      if (!html) return html;
+      if (html.indexOf('data-sekai-mini-app-interaction') !== -1) return html;
+      if (html.indexOf('__sekai_mini_app_interaction_installed') !== -1) return html;
+      var tag = buildMiniAppInteractionScriptTag();
+      var headMatch = html.match(/<head[^>]*>/i);
+      if (headMatch) {
+        var insertPos = (headMatch.index || 0) + headMatch[0].length;
+        return html.slice(0, insertPos) + tag + html.slice(insertPos);
+      }
+      var htmlMatch = html.match(/<html[^>]*>/i);
+      if (htmlMatch) {
+        var htmlPos = (htmlMatch.index || 0) + htmlMatch[0].length;
+        return html.slice(0, htmlPos) + '<head>' + tag + '</head>' + html.slice(htmlPos);
+      }
+      return tag + html;
+    }
+
+    function injectViewportBridgePreludeInline(html) {
+      // 把 viewport bridge 从 injectScripts() 的整段 skip 里救出来。
+      // 上游 game export 模板带 SEKAI_SYNTHETIC_KEY 等特征会触发 injectScripts
+      // 整体 skip——这本意是防止重复装 click 兼容层，但顺手把 innerHeight
+      // 代理 + viewport_height_change 监听一并跳过，导致 game 在 iOS WKWebView
+      // 三层嵌套 (file→file→blob) 下，visibility 切换的瞬时不稳定 viewport 上
+      // 直接初始化 canvas 粒子坐标，出现"头发被挤到屏幕边缘"的视觉 bug。
+      // 这里把 prelude 单独注入到 head 最前面，幂等靠脚本内 flag + 字符串
+      // 特征双重防护，与全量注入路径互斥共存。
+      if (!html) return html;
+      if (html.indexOf('data-sekai-viewport-bridge') !== -1) return html;
+      if (html.indexOf('sekai-viewport-style') !== -1) return html;
+      var tag = buildViewportBridgePreludeScriptTag();
+      var headMatch = html.match(/<head[^>]*>/i);
+      if (headMatch) {
+        var insertPos = (headMatch.index || 0) + headMatch[0].length;
+        return html.slice(0, insertPos) + tag + html.slice(insertPos);
+      }
+      var htmlMatch = html.match(/<html[^>]*>/i);
+      if (htmlMatch) {
+        var htmlPos = (htmlMatch.index || 0) + htmlMatch[0].length;
+        return html.slice(0, htmlPos) + '<head>' + tag + '</head>' + html.slice(htmlPos);
+      }
+      return tag + html;
+    }
+
+    function escapeHtmlAttribute(value) {
+      return String(value || '')
+        .replace(/&/g, '&amp;')
+        .replace(/"/g, '&quot;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+    }
+
+    function baseHrefFor(fetchUrl) {
+      try {
+        return new URL('.', fetchUrl).href;
+      } catch (_e) {
+        return '';
+      }
+    }
+
+    function injectBaseHrefInline(html, fetchUrl) {
+      if (!html) return html;
+      if (/<base\s/i.test(html)) return html;
+      var href = baseHrefFor(fetchUrl);
+      if (!href) return html;
+      var tag = '<base data-sekai-local-base="1" href="' + escapeHtmlAttribute(href) + '">';
+      var headMatch = html.match(/<head[^>]*>/i);
+      if (headMatch) {
+        var insertPos = (headMatch.index || 0) + headMatch[0].length;
+        return html.slice(0, insertPos) + tag + html.slice(insertPos);
+      }
+      var htmlMatch = html.match(/<html[^>]*>/i);
+      if (htmlMatch) {
+        var htmlPos = (htmlMatch.index || 0) + htmlMatch[0].length;
+        return html.slice(0, htmlPos) + '<head>' + tag + '</head>' + html.slice(htmlPos);
+      }
+      return tag + html;
+    }
+
+    function resolveFetchableLocalUrl(url) {
+      // resolveLocalUrl 用相对路径给 iframe.src，这里要给父 frame fetch 用，
+      // 需要绝对地址。base 就是父 frame 自己的 location。
+      var resolved = resolveLocalUrl(url);
+      try {
+        return new URL(resolved, window.location.href).href;
+      } catch (_e) {
+        return resolved;
+      }
+    }
+
+    function revokeBlobUrl() {
+      if (_blobUrl) {
+        URL.revokeObjectURL(_blobUrl);
+        _blobUrl = null;
+      }
+    }
+
+    function postToParent(message) {
+      window.parent.postMessage(message, '*');
+    }
+
+    function postToChild(message) {
+      var frame = contentFrame();
+      if (!frame || !frame.contentWindow) return;
+      frame.contentWindow.postMessage(message, '*');
+    }
+
+    function stopFrameVibration() {
+      _frameVibrationGateOpen = false;
+      clearFrameVibrationState();
+    }
+
+    function resumeFrameVibration() {
+      _frameVibrationGateOpen = true;
+    }
+
+    function replayRuntimeLifecycleToChild(reason) {
+      if (!_lastRuntimeLifecycleType) return;
+      postToChild({ type: _lastRuntimeLifecycleType });
+    }
+
+    function patchLegacyAudioSession(html) {
+      var functionPattern = /function\s+unlockAudioContext\s*\([^)]*\)\s*\{/g;
+      var result = '';
+      var lastIndex = 0;
+      var match;
+
+      while ((match = functionPattern.exec(html)) !== null) {
+        result += html.slice(lastIndex, match.index);
+
+        var functionHeaderEnd = match.index + match[0].length;
+        var braceCount = 1;
+        var i = functionHeaderEnd;
+
+        while (i < html.length && braceCount > 0) {
+          if (html[i] === '{') braceCount++;
+          else if (html[i] === '}') braceCount--;
+          i++;
+        }
+
+        var entireFunction = html.slice(match.index, i);
+        var patchedFunction = entireFunction.replace(
+          /((?:window\.)?(?:navigator\.)?audioSession\.type\s*=\s*)["']play-and-record["']/g,
+          '$1"playback"'
+        );
+
+        result += patchedFunction;
+        lastIndex = i;
+      }
+
+      result += html.slice(lastIndex);
+      return result;
+    }
+
+    function buildInjectedScripts(initialAudioMuted) {
+      var muted = initialAudioMuted ? 'true' : 'false';
+      return [
+        '<!-- sekai:online-scripts -->',
+        '<script>',
+        buildInjectedVibrationGovernorScript(),
+        // Camera / microphone polyfill for blob:https:// context.
+        // When g3_feed_game_frame.html is served over HTTPS, the game blob
+        // iframe has origin null (opaque) and is cross-origin with the parent.
+        // window.parent.navigator is blocked by CORS, so we use a postMessage
+        // bridge instead: the blob iframe posts sekai:camera_request to the
+        // parent, the parent (HTTPS, has camera permission) calls the real
+        // getUserMedia, then replies with sekai:camera_response via
+        // postMessage. We also stub navigator.permissions.query
+        // for camera/mic to return 'granted' so permission-check paths work.
+        '(function(){try{var _pending={};var _seq=0;function _post(msg){try{window.parent.postMessage(msg,\'*\');}catch(_e){}}window.addEventListener(\'message\',function(ev){var d=ev&&ev.data;if(!d||d.type!==\'sekai:camera_response\')return;var p=_pending[d.id];if(!p)return;delete _pending[d.id];if(d.ok&&d.stream){p.resolve(d.stream);}else{var e=new (window[d.errorName]||Error)(d.errorMessage||\'Permission denied\');e.name=d.errorName||\'NotAllowedError\';p.reject(e);}});var _nativeMd=navigator.mediaDevices||{};var _md={};for(var k in _nativeMd){try{_md[k]=typeof _nativeMd[k]===\'function\'?_nativeMd[k].bind(_nativeMd):_nativeMd[k];}catch(_e){}}_md.getUserMedia=function(constraints){return new Promise(function(resolve,reject){if(_nativeMd&&typeof _nativeMd.getUserMedia===\'function\'){_nativeMd.getUserMedia(constraints).then(function(stream){resolve(stream);}).catch(function(err){var id=++_seq;_pending[id]={resolve:resolve,reject:reject};_post({type:\'sekai:camera_request\',id:id,constraints:JSON.parse(JSON.stringify(constraints||{}))});});}else{var id=++_seq;_pending[id]={resolve:resolve,reject:reject};_post({type:\'sekai:camera_request\',id:id,constraints:JSON.parse(JSON.stringify(constraints||{}))});}});};try{Object.defineProperty(navigator,\'mediaDevices\',{configurable:true,enumerable:true,get:function(){return _md;}});}catch(_e1){try{navigator.mediaDevices=_md;}catch(_e2){}}if(navigator.permissions&&!navigator.permissions.__sekai_patched){var _origQ=navigator.permissions.query.bind(navigator.permissions);navigator.permissions.query=function(desc){if(desc&&(desc.name===\'camera\'||desc.name===\'microphone\')){return Promise.resolve({state:\'granted\',onchange:null});}return _origQ(desc);};navigator.permissions.__sekai_patched=true;}}catch(_e){}})();',
+        '(function(){function e(){var m=document.querySelector(\'meta[name="viewport"]\');if(!m){m=document.createElement(\'meta\');m.name=\'viewport\';document.head.insertBefore(m,document.head.firstChild)}m.content=\'width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no\'}document.readyState===\'loading\'?document.addEventListener(\'DOMContentLoaded\',e):e();})();',
+        '(function(){var oA=EventTarget.prototype.addEventListener,oR=EventTarget.prototype.removeEventListener,wm=new WeakMap();EventTarget.prototype.addEventListener=function(t,fn,o){if(t===\'click\'&&typeof fn===\'function\'){var m=wm.get(this);if(!m){m=new Map();wm.set(this,m)}var ex=m.get(fn);if(ex)return oA.call(this,\'pointerup\',ex,o);var w=function(e){if(e.button!==0)return;try{fn.call(this,e)}catch(_){}};m.set(fn,w);return oA.call(this,\'pointerup\',w,o)}return oA.call(this,t,fn,o)};EventTarget.prototype.removeEventListener=function(t,fn,o){if(t===\'click\'&&typeof fn===\'function\'){var m=wm.get(this);if(m){var w=m.get(fn);if(w){m.delete(fn);return oR.call(this,\'pointerup\',w,o)}}}return oR.call(this,t,fn,o)}})();',
+        '(function(){var lt=0;document.addEventListener(\'touchstart\',function(){lt=Date.now()},{passive:true,capture:true});document.addEventListener(\'touchend\',function(){lt=Date.now()},{passive:true,capture:true});document.addEventListener(\'mousedown\',function(e){if(Date.now()-lt<200){var t=e.target;if(t.tagName===\'INPUT\'||t.tagName===\'TEXTAREA\'||t.isContentEditable)return;e.stopPropagation();e.preventDefault()}},{capture:true});var oA=EventTarget.prototype.addEventListener;EventTarget.prototype.addEventListener=function(t,fn,o){if(t===\'touchstart\'||t===\'touchmove\')return oA.call(this,t,fn,Object.assign({},o||{},{passive:true}));return oA.call(this,t,fn,o)}})();',
+        '(function(){function s(msg){if(msg===null||msg===undefined)return \'\';if(typeof msg===\'string\')return msg;if(typeof msg===\'object\'){try{return JSON.stringify(msg);}catch(_e){return String(msg);}}return String(msg);}window.onerror=function(message,source,lineno,colno,error){var m=s(message);if(m.indexOf(\'Unable to preventDefault inside passive event listener\')!==-1)return true;window.parent.postMessage({type:\'sekai_iframe_js_error\',message:m,source:source||\'\',lineno:lineno||0,colno:colno||0,errorName:error?error.name:\'\',errorStack:error?error.stack:\'\'},\'*\');return false;};window.addEventListener(\'unhandledrejection\',function(event){var reason=event.reason;var isError=reason instanceof Error;var m=reason?s(reason):\'Unhandled promise rejection\';if(m.indexOf(\'Unable to preventDefault inside passive event listener\')!==-1)return;window.parent.postMessage({type:\'sekai_iframe_js_error\',message:m,source:\'unhandledrejection\',lineno:0,colno:0,errorName:isError?reason.name:\'\',errorStack:isError?reason.stack:\'\'},\'*\');});})();',
+        '(function(){var isMuted=' + muted + ',mutedEls=new WeakMap(),pendingResume=[],intendedPlaying=new Set(),ctxs=[];var oAC=window.AudioContext||window.webkitAudioContext;if(oAC){var P=function(){var c=new oAC();ctxs.push(c);if(isMuted)c.suspend().catch(function(){});return c};P.prototype=oAC.prototype;window.AudioContext=P;if(window.webkitAudioContext)window.webkitAudioContext=P}var aEls=[],oAudio=window.Audio;if(oAudio){window.Audio=function(s){var a=new oAudio(s);aEls.push(a);if(isMuted)a.muted=true;return a};window.Audio.prototype=oAudio.prototype}var vEls=[],oCE=document.createElement;document.createElement=function(tag){var el=oCE.call(document,tag);if(typeof tag===\'string\'){var t=tag.toLowerCase();if(t===\'audio\'){aEls.push(el);if(isMuted)el.muted=true}else if(t===\'video\'){vEls.push(el);if(isMuted)el.muted=true}}return el};if(window.HTMLMediaElement){var oP=HTMLMediaElement.prototype.play,oPa=HTMLMediaElement.prototype.pause;HTMLMediaElement.prototype.play=function(){intendedPlaying.add(this);if(isMuted&&!mutedEls.has(this)){mutedEls.set(this,this.muted);this.muted=true}return oP.apply(this,arguments)};HTMLMediaElement.prototype.pause=function(){intendedPlaying.delete(this);return oPa.apply(this,arguments)}}function muteAll(){if(isMuted)return;isMuted=true;pendingResume=[];ctxs.forEach(function(c){if(c&&c.state===\'running\')c.suspend().catch(function(){})});document.querySelectorAll(\'audio,video\').forEach(function(e){mutedEls.set(e,e.muted);e.muted=true});aEls.forEach(function(a){try{if(!mutedEls.has(a))mutedEls.set(a,a.muted);a.muted=true}catch(_){}});vEls.forEach(function(v){try{if(!mutedEls.has(v))mutedEls.set(v,v.muted);v.muted=true}catch(_){}})}function resumeCtx(){ctxs.forEach(function(c){if(c&&(c.state===\'suspended\'||c.state===\'interrupted\'))c.resume().catch(function(){})})}function unmuteAll(){if(!isMuted)return;isMuted=false;resumeCtx();document.querySelectorAll(\'audio,video\').forEach(function(e){var w=mutedEls.get(e);e.muted=w!==undefined?w:false});aEls.forEach(function(a){try{var w=mutedEls.get(a);a.muted=w!==undefined?w:false}catch(_){}});vEls.forEach(function(v){try{var w=mutedEls.get(v);v.muted=w!==undefined?w:false}catch(_){}});intendedPlaying.forEach(function(e){pendingResume.push(e)});pendingResume.forEach(function(e){try{if(e.paused)e.play().catch(function(){})}catch(_){}})}document.addEventListener(\'touchstart\',function(){if(isMuted)return;resumeCtx();if(!pendingResume.length)return;var t=pendingResume;pendingResume=[];t.forEach(function(e){try{if(!e.paused)return;e.play().catch(function(){pendingResume.push(e)})}catch(_){pendingResume.push(e)}})},{passive:true,capture:true});window.addEventListener(\'message\',function(ev){var d=ev.data;if(typeof d===\'string\'){try{d=JSON.parse(d)}catch(_){return}}if(!d)return;if(d.type===\'receive_audio_mute\'||(d.origin===\'sekai_gaming_iframe_api\'&&d.type===\'receive_audio_mute\'))muteAll();if(d.type===\'receive_audio_unmute\'||(d.origin===\'sekai_gaming_iframe_api\'&&d.type===\'receive_audio_unmute\'))unmuteAll()});window.addEventListener(\'DOMContentLoaded\',function(){window.parent.postMessage({origin:\'sekai_gaming_iframe_api\',type:\'sekai_iframe_dom_ready\'},\'*\')})})();',
+        '(function(){var s=document.createElement(\'style\');s.textContent=\'html,body{overscroll-behavior:contain!important;height:100%!important;-webkit-user-select:none!important;user-select:none!important;touch-action:none!important;}\';document.head.appendChild(s);var st=null;function findScr(el){while(el&&el!==document.body&&el!==document.documentElement){var cs=window.getComputedStyle(el);if((cs.overflowY===\'auto\'||cs.overflowY===\'scroll\')&&el.scrollHeight>el.clientHeight)return el;el=el.parentElement}return null}document.addEventListener(\'touchstart\',function(e){st=e.touches.length===1?findScr(e.target):null;if(st)st.style.touchAction=\'pan-y\'},{passive:true,capture:true});document.addEventListener(\'touchend\',function(){if(st){st.style.touchAction=\'\';st=null}},{passive:true,capture:true});document.addEventListener(\'focusin\',function(e){var t=e.target;if(t.tagName===\'INPUT\'||t.tagName===\'TEXTAREA\'||t.isContentEditable)window.parent.postMessage({type:\'iframe-focusin\'},\'*\')},true);document.addEventListener(\'focusout\',function(e){var t=e.target,r=e.relatedTarget;if((t.tagName===\'INPUT\'||t.tagName===\'TEXTAREA\'||t.isContentEditable)&&!(r&&(r.tagName===\'INPUT\'||r.tagName===\'TEXTAREA\'||r.isContentEditable)))window.parent.postMessage({type:\'iframe-focusout\'},\'*\')},true)})();',
+        // innerHeight getter 统一代理到 document.documentElement.clientHeight，
+        // 不冻结瞬时常量。键盘态我们强制 html{height:Npx}，getter 返回 N；
+        // 非键盘态 html{height:100%}，getter 返回真实 iframe 视口高度。
+        //
+        // resize 事件只在 actual clientWidth×clientHeight 变化时才派发。
+        // 原因：shell ResizeObserver 在非键盘态持续广播 height:null；
+        // apply 的 h===cur dedup 会吃掉 CSS 写入，但若 resize 每次都派发，
+        // 游戏的 resize handler 会反复执行 canvas.width=container.clientWidth
+        // 并丢弃 pixelRatio 乘数（Matter.js 等引擎的 Render.setPixelRatio
+        // 设置的 canvas intrinsic = w*pR 被重置为 w），导致 setTransform(pR,...)
+        // 把所有图形画在 pR 倍坐标上，造成 Y 偏移 + 裁切。
+        // 维度 guard 用 clientWidth+'x'+clientHeight 字符串做 dedup；
+        // 真正的 viewport 变化（旋转 / 键盘）维度一定变化，resize 照常派发。
+        '(function(){var vs=document.createElement(\'style\');vs.id=\'sekai-viewport-style\';document.head.appendChild(vs);try{Object.defineProperty(window,\'innerHeight\',{get:function(){return document.documentElement.clientHeight},configurable:true})}catch(_){}var cur=false;function apply(h){if(h===cur)return;cur=h;if(typeof h===\'number\'&&h>0){vs.textContent=\':root{--sekai-viewport-height:\'+h+\'px}html{height:\'+h+\'px!important;overflow:hidden!important}body{height:\'+h+\'px!important;overflow:hidden!important}#game-container{height:\'+h+\'px!important}\'}else{vs.textContent=\':root{--sekai-viewport-height:100%}html{height:100%!important;overflow:hidden!important}body{height:100%!important;overflow:hidden!important}\'}}var _dk=(function(){var d=document.documentElement;return d?(d.clientWidth+"x"+d.clientHeight):"";})();window.addEventListener(\'message\',function(e){if(e.data&&e.data.type===\'viewport_height_change\'){apply(typeof e.data.height===\'number\'?e.data.height:null);var d=document.documentElement;var nk=d?(d.clientWidth+"x"+d.clientHeight):"";if(nk!==_dk){_dk=nk;try{window.dispatchEvent(new Event(\'resize\'))}catch(_){}}}});window.parent.postMessage({type:\'viewport_ready\'},\'*\')})();',
+        // Feed perf resource observer — collects PerformanceResourceTiming
+        // after load, groups by type, posts summary to parent as
+        // sekai_iframe_perf_resources. Mirrors v1 feedPerfResourceScript.ts.
+        '(function(){if(typeof window===\'undefined\'||!window.PerformanceObserver)return;var collected=[];function mapType(t){t=t||\'\';if(t===\'script\')return\'script\';if(t===\'link\'||t===\'css\')return\'stylesheet\';if(t===\'img\')return\'image\';if(t===\'audio\')return\'audio\';if(t===\'font\')return\'font\';if(t===\'xmlhttprequest\'||t===\'fetch\'||t===\'beacon\')return\'fetch\';return\'other\';}try{var obs=new PerformanceObserver(function(list){var e=list.getEntries();for(var i=0;i<e.length;i++)collected.push(e[i]);});obs.observe({type:\'resource\',buffered:true});}catch(e){return;}function summarize(){var byType={};var total=collected.length,ok=0,err=0,bytes=0,dur=0;for(var i=0;i<collected.length;i++){var e=collected[i];var rt=mapType(e.initiatorType);if(!byType[rt])byType[rt]={total_count:0,success_count:0,error_count:0,total_size_bytes:0,max_size_bytes:0,total_duration_ms:0,max_duration_ms:0};var b=byType[rt];b.total_count++;var d=Math.round(e.duration||0);var sz=Math.round((e.transferSize||0)+(e.encodedBodySize||0));var st=e.responseStatus||0;var good=st===0||(st>=200&&st<400);if(good){b.success_count++;ok++;}else if(st>=400){b.error_count++;err++;}else{b.success_count++;ok++;}b.total_size_bytes+=sz;if(sz>b.max_size_bytes)b.max_size_bytes=sz;b.total_duration_ms+=d;if(d>b.max_duration_ms)b.max_duration_ms=d;bytes+=sz;dur+=d;}try{window.parent.postMessage({type:\'sekai_iframe_perf_resources\',payload:{byType:byType,resource_total_count:total,resource_success_count:ok,resource_error_count:err,resource_total_size_bytes:bytes,total_duration_ms:dur}},\'*\');}catch(_){}}if(document.readyState===\'complete\')setTimeout(summarize,400);else window.addEventListener(\'load\',function(){setTimeout(summarize,400);});})();',
+        '(function(){if(typeof window===\'undefined\'||!window.PerformanceObserver)return;var items=[];function clean(u){u=String(u||\'\').split(\'?\')[0];return u.length>140?u.slice(u.length-140):u;}function sizeOf(e){return Math.round((e.transferSize||0)+(e.encodedBodySize||0));}try{new PerformanceObserver(function(list){var es=list.getEntries();for(var i=0;i<es.length;i++)items.push(es[i]);}).observe({type:\'resource\',buffered:true});}catch(e){return;}function topBy(fn){return items.slice().sort(function(a,b){return fn(b)-fn(a);}).slice(0,5).map(function(e){return{name:clean(e.name),type:e.initiatorType||\'other\',duration_ms:Math.round(e.duration||0),size_bytes:sizeOf(e),status:e.responseStatus||0};});}function send(){try{window.parent.postMessage({type:\'sekai_iframe_perf_resource_details\',payload:{tailwind_cdn_detected:items.some(function(e){return String(e.name||\'\').indexOf(\'cdn.tailwindcss.com\')!==-1;}),top_slowest:topBy(function(e){return e.duration||0;}),top_largest:topBy(sizeOf)}},\'*\');}catch(_){}}if(document.readyState===\'complete\')setTimeout(send,450);else window.addEventListener(\'load\',function(){setTimeout(send,450);});})();',
+        // Feed perf audibility observer — media-only signal (audio/video
+        // elements). Emits edge transitions as sekai_iframe_audio_playing_
+        // started/stopped, used to detect "should have played but didn\'t"
+        // and post-leave audio leakage. AudioContext tracking is intentionally
+        // skipped in native feed v1 (closure boundary with the mute script);
+        // most games use <audio>/<video> so coverage is acceptable.
+        // Device motion / orientation receiver — iOS WKWebView doesn't expose
+        // DeviceMotionEvent.requestPermission() nor does it fire real sensor
+        // events inside an app WebView. Native Flutter subscribes to sensors
+        // via sensors_plus and pushes samples down through the shell; this
+        // script intercepts:
+        //   1. addEventListener('devicemotion' / 'deviceorientation' /
+        //      'deviceorientationabsolute')
+        //   2. direct property assignments window.ondevicemotion /
+        //      window.ondeviceorientation (some games use this form)
+        // so the game's existing listeners get fed synthetic events, and
+        // stubs out *Event.requestPermission() to always resolve 'granted'
+        // so gated code paths (like "Enable Tilt" buttons) proceed.
+        // Emits console heartbeats (attach, stub, first dispatch) so the
+        // native console observer can confirm the pipeline end-to-end.
+        '(function(){try{var motionLs=[],orientLs=[];var onMotionProp=null,onOrientProp=null;var dispatchCount=0;var _prevHM=false;function _nm(){var h=motionLs.length>0||orientLs.length>0||!!onMotionProp||!!onOrientProp;if(h!==_prevHM){_prevHM=h;try{window.parent.postMessage({type:\'sekai:motion-needed\',needed:h},\'*\');}catch(_){}}}var oAdd=EventTarget.prototype.addEventListener,oRem=EventTarget.prototype.removeEventListener;EventTarget.prototype.addEventListener=function(t,fn,o){if(this===window&&typeof fn===\'function\'){if(t===\'devicemotion\'){motionLs.push(fn);_nm();console.log(\'[SekaiMotionRx] devicemotion listener attached total=\'+motionLs.length);}else if(t===\'deviceorientation\'||t===\'deviceorientationabsolute\'){orientLs.push(fn);_nm();console.log(\'[SekaiMotionRx] \'+t+\' listener attached total=\'+orientLs.length);}}return oAdd.call(this,t,fn,o);};EventTarget.prototype.removeEventListener=function(t,fn,o){if(this===window&&typeof fn===\'function\'){var a=t===\'devicemotion\'?motionLs:(t===\'deviceorientation\'||t===\'deviceorientationabsolute\')?orientLs:null;if(a){var i=a.indexOf(fn);if(i!==-1){a.splice(i,1);_nm();}}}return oRem.call(this,t,fn,o);};function defProp(name,getFn,setFn){try{Object.defineProperty(window,name,{configurable:true,get:getFn,set:setFn});}catch(_){}}defProp(\'ondevicemotion\',function(){return onMotionProp;},function(fn){onMotionProp=typeof fn===\'function\'?fn:null;_nm();console.log(\'[SekaiMotionRx] ondevicemotion assigned=\'+!!onMotionProp);});defProp(\'ondeviceorientation\',function(){return onOrientProp;},function(fn){onOrientProp=typeof fn===\'function\'?fn:null;_nm();console.log(\'[SekaiMotionRx] ondeviceorientation assigned=\'+!!onOrientProp);});function stubPerm(ctor,name){if(!ctor)return;try{ctor.requestPermission=function(){console.log(\'[SekaiMotionRx] \'+name+\'.requestPermission() -> granted (stub)\');return Promise.resolve(\'granted\');};}catch(_){}}stubPerm(window.DeviceMotionEvent,\'DeviceMotionEvent\');stubPerm(window.DeviceOrientationEvent,\'DeviceOrientationEvent\');console.log(\'[SekaiMotionRx] receiver installed; DME=\'+(typeof window.DeviceMotionEvent)+\' DOE=\'+(typeof window.DeviceOrientationEvent));window.addEventListener(\'message\',function(e){var d=e.data;if(!d||typeof d!==\'object\')return;if(d.type===\'__sekai_device_motion__\'){var ev={type:\'devicemotion\',acceleration:d.acceleration||null,accelerationIncludingGravity:d.accelerationIncludingGravity||null,rotationRate:d.rotationRate||null,interval:d.interval||16,timeStamp:d.timestamp||Date.now(),target:window,currentTarget:window,preventDefault:function(){},stopPropagation:function(){},stopImmediatePropagation:function(){}};if(dispatchCount===0)console.log(\'[SekaiMotionRx] first motion dispatch ls=\'+motionLs.length+\' prop=\'+!!onMotionProp);dispatchCount++;for(var i=0;i<motionLs.length;i++){try{motionLs[i].call(window,ev);}catch(_){}}if(onMotionProp){try{onMotionProp.call(window,ev);}catch(_){}}}else if(d.type===\'__sekai_device_orientation__\'){var oe={type:\'deviceorientation\',alpha:d.alpha==null?null:d.alpha,beta:d.beta==null?null:d.beta,gamma:d.gamma==null?null:d.gamma,absolute:!!d.absolute,timeStamp:d.timestamp||Date.now(),target:window,currentTarget:window,preventDefault:function(){},stopPropagation:function(){},stopImmediatePropagation:function(){}};if(dispatchCount===0)console.log(\'[SekaiMotionRx] first orientation dispatch ls=\'+orientLs.length+\' prop=\'+!!onOrientProp);dispatchCount++;for(var j=0;j<orientLs.length;j++){try{orientLs[j].call(window,oe);}catch(_){}}if(onOrientProp){try{onOrientProp.call(window,oe);}catch(_){}}}});}catch(e){console.log(\'[SekaiMotionRx] install error: \'+e);}})();',
+        '(function(){var last=false,sched=false;function isAudible(el){try{if(el.paused||el.ended||el.muted)return false;var v=typeof el.volume===\'number\'?el.volume:1;return v>0;}catch(_){return false;}}function compute(){var ls=document.querySelectorAll(\'audio,video\');for(var i=0;i<ls.length;i++){if(isAudible(ls[i]))return true;}return false;}function notify(){var a=compute();if(a===last)return;last=a;try{window.parent.postMessage({type:a?\'sekai_iframe_audio_playing_started\':\'sekai_iframe_audio_playing_stopped\',timestamp:Date.now()},\'*\');}catch(_){}}function schedule(){if(sched)return;sched=true;Promise.resolve().then(function(){sched=false;notify();});}[\'play\',\'playing\',\'pause\',\'ended\',\'volumechange\',\'emptied\'].forEach(function(n){document.addEventListener(n,function(e){var t=e.target&&e.target.tagName;if(t!==\'AUDIO\'&&t!==\'VIDEO\')return;schedule();},true);})})();',
+        '<\/script>',
+      ].join('');
+    }
+
+    function injectScripts(html, options) {
+      var patchedHtml = patchLegacyAudioSession(html || '');
+      // 双注入防护：上游 game export 模板如果已经内联了 Sekai 兼容脚本，
+      // 这里就整体 skip。单独一行 <!-- sekai:online-scripts --> 锚太脆，
+      // 追加两个独家特征做 OR 兜底：
+      //   - SEKAI_SYNTHETIC_KEY 是模板里 click blocker 的常量，frame 注入版本不含
+      //   - sekai_iframe_swipe_up 是模板里的 swipe 上滑 message type，frame 注入版本不含
+      // 只要命中任一特征就说明模板已内联全套，不再注入第二份——否则 game 自带
+      // 的 document click blocker 会被 frame 的 click→pointerup 改写改挂到
+      // document pointerup capture 上，stopImmediatePropagation() 斩断整个
+      // pointerup 事件流，造成按钮点不动 / 画笔松手停不下来。
+      if (
+        patchedHtml.indexOf('<!-- sekai:online-scripts -->') !== -1 ||
+        patchedHtml.indexOf('SEKAI_SYNTHETIC_KEY') !== -1 ||
+        patchedHtml.indexOf('sekai_iframe_swipe_up') !== -1
+      ) {
+        dbg('injectScripts:skip', {
+          hasAnchor: patchedHtml.indexOf('<!-- sekai:online-scripts -->') !== -1,
+          hasSyntheticKey: patchedHtml.indexOf('SEKAI_SYNTHETIC_KEY') !== -1,
+          hasSwipeUp: patchedHtml.indexOf('sekai_iframe_swipe_up') !== -1,
+          len: patchedHtml.length,
+        });
+        return patchedHtml;
+      }
+      dbg('injectScripts:injected', { len: patchedHtml.length });
+
+      var injectedScripts = buildInjectedScripts(options && options.initialAudioMuted === true);
+      var headMatch = patchedHtml.match(/<head[^>]*>/i);
+      if (headMatch) {
+        var insertPos = (headMatch.index || 0) + headMatch[0].length;
+        return patchedHtml.slice(0, insertPos) + injectedScripts + patchedHtml.slice(insertPos);
+      }
+
+      var htmlMatch = patchedHtml.match(/<html[^>]*>/i);
+      if (htmlMatch) {
+        var htmlPos = (htmlMatch.index || 0) + htmlMatch[0].length;
+        return patchedHtml.slice(0, htmlPos) + '<head>' + injectedScripts + '</head>' + patchedHtml.slice(htmlPos);
+      }
+
+      return injectedScripts + patchedHtml;
+    }
+
+    function setFrameSource(source) {
+      var frame = contentFrame();
+      if (!frame) return;
+      dbg('setFrameSource', { source: source });
+      perf('setFrameSource', { is_blob: /^blob:/i.test(String(source || '')) });
+      frame.src = source || 'about:blank';
+    }
+
+    function xhrLoad(url) {
+      return new Promise(function (resolve, reject) {
+        var xhr = new XMLHttpRequest();
+        xhr.open('GET', url);
+        xhr.onload = function () {
+          resolve({
+            ok: xhr.status >= 200 && xhr.status < 400,
+            status: xhr.status,
+            text: function () { return Promise.resolve(xhr.responseText); }
+          });
+        };
+        xhr.onerror = function () { reject(new Error('XHR network error')); };
+        xhr.send();
+      });
+    }
+
+    function resetHairGuardReadyState(enabled) {
+      _delayDomReadyForHairGuard = !!enabled;
+      _hairGuardReady = !enabled;
+      _pendingHairGuardDomReady = null;
+    }
+
+    function isUsableHairGuardDims(dims) {
+      return !!dims && dims.iw > 0 && dims.ih > 0 && dims.deW > 0 && dims.deH > 0;
+    }
+
+    function markHairGuardReady(reason, extra) {
+      if (!_delayDomReadyForHairGuard) return;
+      _hairGuardReady = true;
+      perf('child:hair_guard_ready', { reason: reason, extra: extra || null });
+      if (_pendingHairGuardDomReady) {
+        perf('child:dom_ready', { gated_by: 'hair_guard', reason: reason });
+        postToParent(_pendingHairGuardDomReady);
+        _pendingHairGuardDomReady = null;
+      }
+    }
+
+    async function loadHtmlViaBlob(fetchUrl, token, options) {
+      dbg('fetch:start', { fetchUrl: fetchUrl, token: token });
+      perf('fetch:start', { remote: !!(options && options.remote) });
+      var response = await xhrLoad(fetchUrl);
+      dbg('fetch:response', { fetchUrl: fetchUrl, status: response.status, ok: response.ok });
+      perf('fetch:response', { status: response.status });
+      if (!response.ok) {
+        throw new Error('HTTP ' + response.status);
+      }
+
+      var fetchedHtml = await response.text();
+      dbg('fetch:text', { len: fetchedHtml.length });
+      perf('fetch:text', { bytes: fetchedHtml.length });
+      if (token !== _loadToken) {
+        dbg('fetch:stale', { token: token, current: _loadToken });
+        return;
+      }
+
+      resetHairGuardReadyState(isHairCanvasGameHtml(fetchedHtml));
+      var injectedHtml = injectBaseHrefInline(fetchedHtml, fetchUrl);
+      injectedHtml = injectScripts(injectedHtml, {
+        initialAudioMuted: _requestedMuted,
+      });
+      // iOS WKWebView 下，HTTPS 内容被 blob 化后 origin 变成 blob:file://，
+      // 加上父 frame 的 mousedown preventDefault 去抖，原生 click 常常不再
+      // 触达 <button onclick="..."> 的属性处理程序。compat 在 pointerup 直接
+      // .onclick.call() 兜底，覆盖 remote 与 local 两条路径。幂等由脚本里
+      // __sekai_local_click_compat_installed 保证。
+      var before = injectedHtml.length;
+      injectedHtml = injectLocalClickCompatInline(injectedHtml);
+      injectedHtml = injectMissingLibraryCompatInline(injectedHtml);
+      // viewport bridge prelude 必须最后注入：后插入的 inline script 会
+      // 出现在 head 的最前位置，保证在 game 自己的任何 <script> 之前执行，
+      // game 脚本读到的 window.innerHeight 才是 documentElement.clientHeight
+      // 而不是 iOS 切换瞬态下的脏值。
+      injectedHtml = injectViewportBridgePreludeInline(injectedHtml);
+      injectedHtml = injectRuntimeLifecyclePreludeInline(injectedHtml);
+      injectedHtml = injectMiniAppInteractionInline(injectedHtml);
+      // This game initializes hair geometry at DOMContentLoaded. If WebKit has
+      // not laid out the blob iframe yet, initApp sees a 0x0 viewport and keeps
+      // bad hair coordinates until the user taps reset. Guard only matching
+      // hair-canvas exports and defer initApp until the viewport is usable.
+      injectedHtml = injectHairCanvasInitGuardInline(injectedHtml);
+      // 独立诊断脚本不与 viewport bridge 互斥：全量注入路径已经带
+      // sekai-viewport-style 时，上面的 prelude 会跳过，但我们仍需要跨源
+      // console 和 DCL/canvas/viewport dump。
+      injectedHtml = injectIframeDiagnosticsInline(injectedHtml);
+      dbg('inlineClickCompat', {
+        remote: !!(options && options.remote),
+        delta: injectedHtml.length - before,
+        hasTag: injectedHtml.indexOf('data-sekai-local-click-compat') !== -1,
+        hasViewportBridge: injectedHtml.indexOf('data-sekai-viewport-bridge') !== -1,
+      });
+      perf('inject:done', { final_bytes: injectedHtml.length });
+      var blob = new Blob([injectedHtml], { type: 'text/html' });
+      revokeBlobUrl();
+      _blobUrl = URL.createObjectURL(blob);
+      dbg('blob:set', { blobUrl: _blobUrl, finalLen: injectedHtml.length });
+      perf('blob:set', null);
+      setFrameSource(_blobUrl);
+    }
+
+    async function loadGameContent(url) {
+      var token = ++_loadToken;
+      clearFrameVibrationState();
+      // ENG-583: 不在 fetch 前 revoke 旧 blob——content-frame 仍指向它，提前 revoke 会闪黑。
+      resetHairGuardReadyState(false);
+      dbg('loadGameContent', { url: url, token: token });
+      perfReset('loadGameContent', { url_tail: String(url || '').slice(-60) });
+
+      if (!url) {
+        setFrameSource('about:blank');
+        return;
+      }
+
+      var remote = isRemoteUrl(url);
+      var isBlobOrData = /^(blob|data):/i.test(url);
+      dbg('loadGameContent:branch', { remote: remote, isBlobOrData: isBlobOrData, url: url });
+      // 本地（file:// 或相对路径）也走 fetch+blob，与 remote 统一流水线。好处:
+      //  1. click compat 脚本作为 inline <script> 内联到 HTML 字符串，是
+      //     iframe 自身脚本，绕开父 frame 跨 file:// origin 访问子 document
+      //     失败的黑洞（WKWebView 下 childWindow.document 访问常抛 Security
+      //     Error 被静默吞掉，导致外部注入形同虚设）。
+      //  2. blob URL 由父 frame 创建，origin 随父，iframe sandbox 行为更稳定。
+      //  3. 只有一条代码路径，消除 local vs remote 的特殊情况。
+      // blob/data: 已经是就绪内容，不走 fetch，直接交给 setFrameSource。
+      if (isBlobOrData) {
+        setFrameSource(url);
+        return;
+      }
+
+      var fetchUrl = remote ? url : resolveFetchableLocalUrl(url);
+      try {
+        await loadHtmlViaBlob(fetchUrl, token, { remote: remote });
+      } catch (error) {
+        dbg('fetch:error', {
+          remote: remote,
+          fetchUrl: fetchUrl,
+          message: error && error.message ? String(error.message) : String(error),
+          name: error && error.name ? error.name : '',
+        });
+        if (token !== _loadToken) return;
+        // 本地 fetch 失败（比如 WKWebView 没打开 allowFileAccessFromFileURLs）
+        // 回退到直链 file://，至少把游戏显示出来；click compat 这轮就只能靠
+        // 游戏模板自带逻辑了。
+        if (!remote) {
+          dbg('fetch:fallback-direct', { url: url });
+          setFrameSource(resolveLocalUrl(url));
+          return;
+        }
+        setFrameSource('about:blank');
+        postToParent({
+          type: 'sekai_iframe_js_error',
+          message: error && error.message ? error.message : 'load_remote_html_failed',
+          source: 'g3_feed_game_frame',
+          lineno: 0,
+          colno: 0,
+          errorName: error && error.name ? error.name : 'GameFrameLoadError',
+          errorStack: error && error.stack ? error.stack : '',
+        });
+      }
+    }
+
+    function bootstrap(payload) {
+      payload = payload || {};
+      var nextUrl = payload.gameUrl || '';
+      var urlChanged = nextUrl !== _gameUrl;
+      dbg('bootstrap', { nextUrl: nextUrl, prevUrl: _gameUrl, urlChanged: urlChanged, muted: !!payload.isMuted });
+
+      _gameUrl = nextUrl;
+      _requestedMuted = !!payload.isMuted;
+
+      if (!urlChanged) {
+        // shell postBootstrapToFrame 同 URL 重发时：不 reload，只 forward viewport/resize。
+        postToChild({
+          type: 'viewport_height_change',
+          height: null,
+        });
+        return;
+      }
+
+      loadGameContent(_gameUrl);
+    }
+
+    window.addEventListener('message', function (event) {
+      var data = event.data;
+      if (typeof data === 'string') {
+        try { data = JSON.parse(data); } catch (_e) { }
+      }
+
+      if (data && data.type === 'sekai:camera_parent_response') {
+        var _pf = contentFrame();
+        if (_pf && _pf.contentWindow) {
+          try {
+            _pf.contentWindow.postMessage({
+              type: 'sekai:camera_response',
+              id: data.id,
+              ok: !!data.ok,
+              stream: data.stream || null,
+              errorName: data.errorName || null,
+              errorMessage: data.errorMessage || null,
+            }, '*');
+          } catch (_e) {}
+        }
+        return;
+      }
+
+      if (data && data.type === 'sekai:camera_request') {
+        var _frame = contentFrame();
+        if (!_frame || !_frame.contentWindow) return;
+        var _reqId = data.id;
+        var _constraints = data.constraints || { video: true };
+        var _deliver = function(ok, stream, errName, errMsg) {
+          try {
+            _frame.contentWindow.postMessage({
+              type: 'sekai:camera_response',
+              id: _reqId,
+              ok: !!ok,
+              stream: stream || null,
+              errorName: errName || null,
+              errorMessage: errMsg || null,
+            }, '*');
+          } catch (_e) {}
+        };
+        var _askShell = function(reasonName, reasonMsg) {
+          perf('camera:request:shell_fallback', { reason: reasonName || '', message: reasonMsg || '' });
+          try {
+            window.parent.postMessage({
+              type: 'sekai:camera_parent_request',
+              id: _reqId,
+              constraints: _constraints,
+            }, '*');
+          } catch (_e) {
+            _deliver(false, null, reasonName || 'NotAllowedError', reasonMsg || 'Permission denied');
+          }
+        };
+        perf('camera:request:game_frame', { hasMediaDevices: !!navigator.mediaDevices });
+        if (navigator.mediaDevices && typeof navigator.mediaDevices.getUserMedia === 'function') {
+          navigator.mediaDevices.getUserMedia(_constraints).then(function(stream) {
+            perf('camera:success:game_frame', null);
+            _deliver(true, stream, null, null);
+          }).catch(function(err) {
+            perf('camera:error:game_frame', { name: (err && err.name) || '', message: (err && err.message) || '' });
+            _askShell((err && err.name) || 'NotAllowedError', (err && err.message) || 'Permission denied');
+          });
+        } else {
+          _askShell('NotSupportedError', 'mediaDevices not available');
+        }
+        return;
+      }
+
+      var frame = contentFrame();
+
+      if (frame && event.source === frame.contentWindow) {
+        if (data && (data.action === 'gen_vibration' || data.action === 'vibrate')) {
+          forwardFrameVibration(data);
+          return;
+        }
+        if (data && data.type === 'sekai_iframe_dom_ready') {
+          if (_delayDomReadyForHairGuard && !_hairGuardReady) {
+            _pendingHairGuardDomReady = data;
+            perf('child:dom_ready:pending_hair_guard', null);
+            return;
+          }
+          perf('child:dom_ready', null);
+        } else if (data && data.type === 'viewport_ready') {
+          perf('child:viewport_ready', null);
+        } else if (data && data.type === 'sekai_iframe_perf_trace') {
+          perf('child:trace:' + data.tag, data.extra);
+          if (data.tag === 'hair_guard:init_now') {
+            postToParent(data);
+            markHairGuardReady('init_now', data.extra);
+            return;
+          } else if (
+            data.tag === 'hair_guard:ready' ||
+            data.tag === 'hair_guard:timeout' ||
+            data.tag === 'hair_guard:reinit'
+          ) {
+            postToParent(data);
+            markHairGuardReady(data.tag.replace('hair_guard:', ''), data.extra);
+            return;
+          } else if (
+            data.tag === 'hair_guard:DCL' &&
+            data.extra &&
+            data.extra.hooked === false &&
+            isUsableHairGuardDims(data.extra.dims)
+          ) {
+            postToParent(data);
+            markHairGuardReady('dcl_usable_without_hook', data.extra);
+            return;
+          }
+        }
+        postToParent(data);
+        return;
+      }
+
+      if (!data) return;
+
+      if (data.type === 'sekai_feed_frame_bootstrap') {
+        bootstrap(data.payload || {});
+        return;
+      }
+
+      if (data.type === 'sekai:cancel_vibration') {
+        stopFrameVibration();
+        postToChild(data);
+        return;
+      }
+
+      if (data.type === 'sekai:resume_vibration') {
+        resumeFrameVibration();
+        postToChild(data);
+        return;
+      }
+
+      if (data.type === 'sekai:freeze' || data.type === 'sekai:thaw') {
+        _lastRuntimeLifecycleType = data.type;
+      }
+
+      // 屏幕尺寸变化（全屏 / 旋转）→ reload content iframe。
+      // 游戏在新 viewport 从零初始化，彻底规避 canvas pR / 坐标 / resize 时序。
+      // 键盘弹出/收起：shell 传 height:number，不更新基准、不触发 reload。
+      // ENG-583: 仅宽度变化触发 reload。Feed 滑卡/布局抖动常只有高度微变，
+      // 原先 height>50px 会误触 reload（日志里虽少见，保守去掉 height-only 路径）。
+      if (data.type === 'viewport_height_change') {
+        var _dE = document.documentElement;
+        var _curW = _dE ? _dE.clientWidth : 0;
+        var _curH = _dE ? _dE.clientHeight : 0;
+        if (typeof window._sekaiBaseVpW === 'undefined') { window._sekaiBaseVpW = _curW; window._sekaiBaseVpH = _curH; }
+        if (data.height === null || data.height === undefined) {
+          var _wChanged = _curW !== window._sekaiBaseVpW;
+          if (_wChanged && _gameUrl) {
+            dbg('viewport:reload', { prevW: window._sekaiBaseVpW, prevH: window._sekaiBaseVpH, curW: _curW, curH: _curH });
+            window._sekaiBaseVpW = _curW;
+            window._sekaiBaseVpH = _curH;
+            loadGameContent(_gameUrl);
+            return;
+          }
+          window._sekaiBaseVpW = _curW;
+          window._sekaiBaseVpH = _curH;
+        }
+      }
+
+      postToChild(data);
+    });
+
+    document.addEventListener('visibilitychange', function () {
+      if (document.visibilityState === 'hidden') {
+        stopFrameVibration();
+      }
+    });
+
+    (function() {
+      var frame = contentFrame();
+      if (!frame) return;
+      frame.addEventListener('load', function() {
+        var childHref = '';
+        try { childHref = frame.contentWindow && frame.contentWindow.location && frame.contentWindow.location.href; } catch (e) { childHref = '<blocked:' + (e && e.name) + '>'; }
+        var hasInstalled = '';
+        try { hasInstalled = String(!!(frame.contentWindow && frame.contentWindow.__sekai_local_click_compat_installed)); } catch (e) { hasInstalled = '<blocked>'; }
+        dbg('iframe:load', { src: frame.src, childHref: childHref, compatInstalled: hasInstalled });
+        perf('iframe:load', { is_blob: /^blob:/i.test(String(frame.src || '')) });
+        replayRuntimeLifecycleToChild('iframe_load');
+        // Relay window.load as fallback for shell's dom_ready detection.
+        // Fires after ALL resources (including CDN scripts) finish loading;
+        // shell guards with _iframeLoaded so duplicate fires are safe.
+        postToParent({ type: 'sekai_iframe_load_fallback' });
+      });
+      frame.addEventListener('error', function(e) {
+        dbg('iframe:error', { src: frame.src, message: e && e.message });
+      });
+    })();
+
+    window.addEventListener('beforeunload', revokeBlobUrl);
+
+    (function () {
+      var frame = contentFrame();
+      if (!frame) return;
+      frame.addEventListener('error', function () {
+        postToParent({
+          type: 'sekai_iframe_js_error',
+          message: 'content_frame_load_failed',
+          source: 'g3_feed_game_frame',
+          lineno: 0,
+          colno: 0,
+          errorName: 'ContentFrameLoadError',
+          errorStack: '',
+        });
+      });
+    })();
+  </script>
+</body>
+
+</html>
