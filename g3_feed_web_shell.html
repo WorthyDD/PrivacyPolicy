@@ -1,0 +1,2404 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <!--
+    interactive-widget=overlays-content (iOS 16.4+ / Chrome 108+):
+    键盘出现时 UA 不做任何事 —— 不缩 layout viewport，不滚 visual viewport，
+    也不顶起 WebView，纯粹覆盖在内容上方。所有 reflow 交给 __sekaiShellKeyboardChange
+    → sendViewportHeight 那条自建管线。
+
+    如果不加这一条，iOS 默认是 resizes-visual，WKWebView 会把 visual viewport
+    整体上滚让 focused input 可见 → 由于 WKWebView 是 transparentBackground:true，
+    被顶起的底部露出 Flutter ColoredBox(#0B0B10) → 屏幕中部出现黑色空隙。
+    旧 iOS (<16.4) 会忽略这个 keyword，依旧走 resizes-visual，但旧版占比已小。
+  -->
+  <meta name="viewport"
+    content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=overlays-content">
+  <!--
+    Permissions-Policy：把 sensor 类 feature 的 allowlist 从默认的 self
+    扩到 *，允许 file:// shell 把 accelerometer/gyroscope/magnetometer
+    委托给 blob:file:// 的游戏 iframe。没这一条，Chromium/Android WebView
+    会在链路上游就把委托切掉，游戏 iframe 里的 addEventListener
+    ('deviceorientation') / new Accelerometer() 直接 Permissions policy
+    violation（即使 iframe 元素上已经写了 allow="gyroscope; accelerometer"）。
+  -->
+  <meta http-equiv="Permissions-Policy"
+    content="accelerometer=*, gyroscope=*, magnetometer=*, camera=*, microphone=*, autoplay=*, fullscreen=*, clipboard-read=*, clipboard-write=*">
+  <title>Game</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+      -webkit-tap-highlight-color: transparent
+    }
+
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #111;
+      touch-action: none;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif
+    }
+
+    .game-area {
+      position: relative;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      border-radius: 24px;
+      border: 1px solid rgba(255, 255, 255, .05);
+      background: #1a1a1a
+    }
+
+    .game-area iframe {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      border: none;
+      background: #000;
+      touch-action: none
+    }
+
+    .loading {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      /* ENG-583: 不透明 #111 会在 cover→game 切换时闪黑；loading UX 由 Flutter cover 负责 */
+      background: transparent;
+      z-index: 2;
+      transition: opacity .2s ease
+    }
+
+    .loading.hidden {
+      opacity: 0;
+      pointer-events: none
+    }
+
+    .spinner {
+      width: 32px;
+      height: 32px;
+      color: rgba(255, 255, 255, .5);
+      animation: spin 1s linear infinite;
+      transform-origin: center
+    }
+
+    .spinner svg {
+      display: block;
+      width: 100%;
+      height: 100%
+    }
+
+    @keyframes spin {
+      to {
+        transform: rotate(360deg)
+      }
+    }
+  </style>
+</head>
+
+<body>
+  <div class="game-area">
+    <div id="loading" class="loading hidden">
+      <div class="spinner" aria-hidden="true">
+        <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path d="M21 12A9 9 0 1 1 6.219 5.292" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"
+            stroke-width="2" />
+        </svg>
+      </div>
+    </div>
+    <iframe id="game-frame"
+      sandbox="allow-scripts allow-same-origin allow-popups allow-pointer-lock allow-modals allow-forms"
+      allow="autoplay; camera; microphone; clipboard-read; clipboard-write; gyroscope; accelerometer; fullscreen"
+      scrolling="no"></iframe>
+  </div>
+  <script>
+    if (typeof window.receiveMessageFromFlutter !== 'function') {
+      window.receiveMessageFromFlutter = function receiveMessageFromFlutter(message) {
+        window.dispatchEvent(new CustomEvent('flutterMessage', { detail: message }));
+      };
+    }
+
+    var GAME = {};
+    var _authToken = null;
+    var _apiHost = '';
+    var _appUrl = '';
+    var _userId = null;
+    var _isTourist = false;
+    var _uploadCache = {};
+    var _requestedMuted = false;
+    var _isFileProtocol = window.location.protocol === 'file:';
+    var _audioMuted = _isFileProtocol ? true : (document.visibilityState === 'hidden');
+    var _isCardVisible = false;
+    var _iframeLoaded = false;
+    var _iframeActive = false;
+    var _pageReadyRetries = 0;
+    var _isBootstrapped = false;
+    var _firstIframeLoadReported = false;
+    var _isLiked = false;
+    var _isSaved = false;
+    var _likeCount = 0;
+    var _commentCount = 0;
+    var _saveCount = 0;
+    var _bridgeConsoleGameId = '';
+    var _bridgeConsoleCount = 0;
+    var _bridgeConsoleDropped = false;
+    var BRIDGE_CONSOLE_MAX_COUNT = 30;
+    var BRIDGE_CONSOLE_MAX_CHARS = 1000;
+    var SHELL_VIBRATION_MIN_GAP_MS = 250;
+    var SHELL_VIBRATION_MAX_DURATION_MS = 60;
+    var _shellVibrationGateOpen = true;
+    var _lastFlutterVibrationAtMs = 0;
+    var _loadingShowTimer = null;
+    var IFRAME_LOADING_DELAY_MS = 450;
+    var MINI_APP_INTERACTED_THROTTLE_MS = 1000;
+    var _lastMiniAppInteractedAt = 0;
+
+    function canForwardShellVibration() {
+      return _shellVibrationGateOpen &&
+        _iframeActive &&
+        _isCardVisible &&
+        document.visibilityState !== 'hidden';
+    }
+
+    function isFlutterVibrationPayload(payload) {
+      return !!payload &&
+        (payload.action === 'vibrate' || payload.action === 'gen_vibration');
+    }
+
+    function shouldDropFlutterVibration(payload) {
+      if (!isFlutterVibrationPayload(payload)) return false;
+      if (!canForwardShellVibration()) return true;
+      var now = Date.now();
+      if (_lastFlutterVibrationAtMs !== 0 &&
+        now - _lastFlutterVibrationAtMs < SHELL_VIBRATION_MIN_GAP_MS) {
+        return true;
+      }
+      _lastFlutterVibrationAtMs = now;
+      return false;
+    }
+
+    function clampShellVibrationDuration(duration) {
+      var value = Number(duration);
+      if (!isFinite(value) || value <= 0) return 15;
+      return Math.min(Math.round(value), SHELL_VIBRATION_MAX_DURATION_MS);
+    }
+
+    function extractShellVibrationDuration(payload) {
+      if (payload && Array.isArray(payload.pattern)) {
+        var maxDuration = 0;
+        for (var i = 0; i < payload.pattern.length; i++) {
+          maxDuration = Math.max(maxDuration, clampShellVibrationDuration(payload.pattern[i]));
+        }
+        if (maxDuration > 0) return maxDuration;
+      }
+      return clampShellVibrationDuration(payload && payload.duration);
+    }
+
+    function normalizeShellVibrationPayload(payload) {
+      payload = payload || {};
+      return {
+        type: typeof payload.type === 'string' ? payload.type : 'light',
+        duration: extractShellVibrationDuration(payload),
+      };
+    }
+
+    function sendFlutterMessage(payload) {
+      if (shouldDropFlutterVibration(payload)) {
+        return null;
+      }
+      var message = JSON.stringify(payload);
+      if (window.sendMessageToFlutter) {
+        return window.sendMessageToFlutter(message);
+      }
+      if (window.flutter_inappwebview && window.flutter_inappwebview.callHandler) {
+        return window.flutter_inappwebview.callHandler('messageHandler', message);
+      }
+      return null;
+    }
+
+    function notifyNativeFeedMiniAppInteracted() {
+      if (!_isCardVisible || !_iframeActive) return;
+      var now = Date.now();
+      if (_lastMiniAppInteractedAt !== 0 &&
+        now - _lastMiniAppInteractedAt < MINI_APP_INTERACTED_THROTTLE_MS) {
+        return;
+      }
+      _lastMiniAppInteractedAt = now;
+      sendFlutterMessage({ action: 'nativeFeedMiniAppInteracted' });
+    }
+
+    function forwardImportantConsoleLog(level, line) {
+      level = String(level || 'log').toLowerCase();
+      if (level !== 'error' && level !== 'warn' && level !== 'warning') return;
+      var gameId = GAME && GAME.game_id || '';
+      if (_bridgeConsoleGameId !== gameId) {
+        _bridgeConsoleGameId = gameId;
+        _bridgeConsoleCount = 0;
+        _bridgeConsoleDropped = false;
+      }
+      if (_bridgeConsoleCount >= BRIDGE_CONSOLE_MAX_COUNT) {
+        if (_bridgeConsoleDropped) return;
+        _bridgeConsoleDropped = true;
+        sendFlutterMessage({
+          action: 'feedCardConsoleLog',
+          data: {
+            gameId: gameId,
+            level: 'warn',
+            message: 'console log truncated after ' + BRIDGE_CONSOLE_MAX_COUNT + ' entries',
+            truncated: true,
+          },
+        });
+        return;
+      }
+      _bridgeConsoleCount += 1;
+      line = String(line || '');
+      var truncated = line.length > BRIDGE_CONSOLE_MAX_CHARS;
+      if (truncated) line = line.slice(0, BRIDGE_CONSOLE_MAX_CHARS) + '...<truncated>';
+      sendFlutterMessage({
+        action: 'feedCardConsoleLog',
+        data: {
+          gameId: gameId,
+          level: level,
+          message: line,
+          truncated: truncated,
+        },
+      });
+    }
+
+    function reportIframeLoadState(phase, reason, detail) {
+      if (!GAME.game_id) return;
+      var data = {
+        gameId: GAME.game_id,
+        phase: phase,
+        timestamp: Date.now(),
+      };
+      if (reason) data.reason = reason;
+      if (detail) {
+        Object.keys(detail).forEach(function(k) { data[k] = detail[k]; });
+      }
+      sendFlutterMessage({ action: 'feedCardIframeLoadState', data: data });
+    }
+
+    // ─── perf trace (临时调试，验证完删除) ──────────────────────────────
+    // 与 g3_feed_game_frame.html 内 perf() 配对，每条 log 自带 Δ + total。
+    // bootstrap() 重置 base，单次完整加载链路一目了然。同时聚合从 frame
+    // 透传上来的 sekai_feed_frame_perf，让 frame + shell 两层在同一条时间
+    // 轴上对齐。
+    var _perfBase = 0;
+    var _perfLast = 0;
+    function shellPerfReset(tag, extra) {
+      _perfBase = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+      _perfLast = _perfBase;
+      shellPerf(tag, extra);
+    }
+    function shellPerf(tag, extra) {
+      var now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
+      var d = (now - _perfLast).toFixed(0);
+      var t = (now - _perfBase).toFixed(0);
+      _perfLast = now;
+      var line = '[ShellPerf] ' + tag + ' Δ=' + d + 'ms total=' + t + 'ms gameId=' + (GAME && GAME.game_id || '?');
+      if (extra) { try { line += ' ' + JSON.stringify(extra); } catch (_e) {} }
+      try { console.log(line); } catch (_e) {}
+    }
+    function shellPerfFromFrame(payload) {
+      // frame 侧已经算过 Δ + total（基于 frame 自己的 base），直接转印为
+      // [ShellPerf] frame:<tag> 让两层 log 在同一条时间轴可见。
+      if (!payload) return;
+      var line = '[ShellPerf] frame:' + payload.tag + ' Δ=' + payload.delta_ms + 'ms total=' + payload.total_ms + 'ms token=' + payload.token + ' gameId=' + (GAME && GAME.game_id || '?');
+      if (payload.extra) { try { line += ' ' + JSON.stringify(payload.extra); } catch (_e) {} }
+      try { console.log(line); } catch (_e) {}
+    }
+    // ────────────────────────────────────────────────────────────────────
+
+    // Feed perf 事件统一入口：把 iframe 真实加载/资源/音频信号以 perf 消息
+    // 发给 Flutter，由 G3FeedNativeAnalytics 聚合成 perf_g3_feed_load /
+    // perf_g3_feed_audio_start / perf_g3_feed_audio_end。phase 包含：
+    //   - html_ready / dom_ready / dom_timeout / fetch_failed
+    //   - resources / audio_started / audio_stopped
+    function reportPerfEvent(phase, payload) {
+      if (!GAME.game_id) return;
+      sendFlutterMessage({
+        action: 'feedCardPerf',
+        data: {
+          gameId: GAME.game_id,
+          phase: phase,
+          timestamp: Date.now(),
+          payload: payload == null ? null : payload,
+        },
+      });
+    }
+
+    // DOM ready 10s 超时：与 v1 GameIframe 对齐。超时后上报 dom_timeout，
+    // Flutter 侧用这一信号把 content 行收为 status='timeout'。
+    var _domReadyTimeoutId = null;
+    var DOM_READY_TIMEOUT_MS = 30000;
+
+    function startDomReadyTimeout() {
+      clearDomReadyTimeout();
+      _domReadyTimeoutId = setTimeout(function () {
+        _domReadyTimeoutId = null;
+        if (_iframeLoaded) return;
+        reportPerfEvent('dom_timeout', null);
+        // 超时视为白屏/内容失败，通知 Flutter 触发重试兜底逻辑。
+        reportIframeLoadState('error', 'dom_timeout');
+      }, DOM_READY_TIMEOUT_MS);
+    }
+
+    function clearDomReadyTimeout() {
+      if (_domReadyTimeoutId != null) {
+        clearTimeout(_domReadyTimeoutId);
+        _domReadyTimeoutId = null;
+      }
+    }
+
+    function reportFirstIframeLoadSuccess() {
+      if (_firstIframeLoadReported) return;
+      _firstIframeLoadReported = true;
+
+      var duration = (Date.now() - (performance.timeOrigin || performance.timing.navigationStart)) / 1000;
+      sendFlutterMessage({
+        action: 'logEvent',
+        parameters: {
+          eventName: 'g3_first_iframe_load_success',
+          duration: duration,
+          gameId: GAME.game_id || '',
+          versionId: GAME.version_id || '',
+          isOfflineCards: _isFileProtocol,
+          container: 'newFeed',
+        },
+      });
+    }
+
+    function clearLoadingShowTimer() {
+      if (_loadingShowTimer != null) {
+        clearTimeout(_loadingShowTimer);
+        _loadingShowTimer = null;
+      }
+    }
+
+    function showLoading() {
+      var node = document.getElementById('loading');
+      if (node) node.classList.remove('hidden');
+    }
+
+    function hideLoading() {
+      clearLoadingShowTimer();
+      var node = document.getElementById('loading');
+      if (node) node.classList.add('hidden');
+    }
+
+    // 仅当前台 active 卡（非 neighbor 预加载静音态）且加载偏慢时才显示 shell spinner。
+    // 预加载 slot isMuted=true：Flutter 已叠 cover，shell 不再盖黑底（ENG-583）。
+    function shouldShowIframeLoading() {
+      if (!/^https?:\/\//i.test(GAME.game_url || '')) return false;
+      if (_requestedMuted) return false;
+      return true;
+    }
+
+    function scheduleShowLoadingIfSlow() {
+      clearLoadingShowTimer();
+      if (!shouldShowIframeLoading()) return;
+      _loadingShowTimer = setTimeout(function () {
+        _loadingShowTimer = null;
+        if (!_iframeLoaded && _iframeActive) showLoading();
+      }, IFRAME_LOADING_DELAY_MS);
+    }
+
+    function iframeNode() {
+      return document.getElementById('game-frame');
+    }
+
+    // 把不可见卡片的 iframe 设成 visibility:hidden + 发 sekai:freeze
+    // 显式冻结 game 内部 rAF / AudioContext。
+    //
+    // 历史方案：display:none。依赖浏览器 Page Visibility API 自动冻结
+    // rAF，但代价是：
+    //   1) iframe layout 变 0×0 → game resizeCanvas() 拿到 0 →部分 game 死循环
+    //      （为此 loadIframe 上面加了 visibility gate，等 visible 才加载）。
+    //   2) 切回 visible 需重新 layout / paint，200–400ms 才能看到第一帧。
+    //
+    // 新方案（2026-05-06）：visibility:hidden 让 layout 永远稳定（iframe 尺寸
+    // 不变，game canvas 不需重 init）；CPU 通过 sekai:freeze 协议显式控制
+    // （game prelude 拦截 rAF + suspend AudioContext），跨 platform 行为一致；
+    // thaw 几乎 0 延迟（< 16ms）。
+    function applyIframeVisibility() {
+      var iframe = iframeNode();
+      if (!iframe) return;
+      iframe.style.visibility = _isCardVisible ? 'visible' : 'hidden';
+      // 兼容旧逻辑遗留的 display:none（热重载路径存在次序：先设 display:''
+      // 再设 visibility:visible，避免换帕闪一下）。
+      if (_isCardVisible && iframe.style.display === 'none') {
+        iframe.style.display = '';
+      }
+      // 通知 game iframe 冻结 / 解冻（game prelude 监听）。
+      // game_frame.html 已有 postToChild 事件转发机制——shell 发给 game_frame，
+      // game_frame 自动 forward 给孙级 content-frame iframe（注入了 prelude的那个）。
+      if (iframe.contentWindow) {
+        try {
+          var lifecycleType = _isCardVisible ? 'sekai:thaw' : 'sekai:freeze';
+          iframe.contentWindow.postMessage({
+            type: lifecycleType,
+          }, '*');
+        } catch (_e) {}
+      }
+    }
+
+    function postBootstrapToFrame() {
+      var iframe = iframeNode();
+      if (!iframe || !iframe.contentWindow || !_isBootstrapped) return;
+
+      iframe.contentWindow.postMessage({
+        type: 'sekai_feed_frame_bootstrap',
+        payload: {
+          gameUrl: GAME.game_url || '',
+          isMuted: _audioMuted,
+        },
+      }, '*');
+    }
+
+    function buildShareLink() {
+      if (_appUrl) return _appUrl + '/g3-game/community/' + GAME.game_id + '?fromPage=feed&orientation=auto';
+      return GAME.remix_url || GAME.game_url || '';
+    }
+
+    function buildShareContent() {
+      return 'Look! I created an ' + (GAME.title || '').replace(/["""]/g, "'") + ' using AI, and it only took 1 minute!';
+    }
+
+    function nonEmptyString(value) {
+      if (typeof value !== 'string') return '';
+      return value.trim();
+    }
+
+    function buildSharePanelTitle(gameType, requestedTitle) {
+      var gameTitle = nonEmptyString(GAME.title);
+      var title = nonEmptyString(requestedTitle);
+      if (gameType === 'multiplayer') return gameTitle || title;
+      return title || gameTitle;
+    }
+
+    function buildSharePanelCreateName(gameType, creatorName) {
+      if (gameType !== 'multiplayer') return undefined;
+      return nonEmptyString(creatorName) || 'anonymous';
+    }
+
+    function xhrApi(url, options) {
+      options = options || {};
+      return new Promise(function (resolve, reject) {
+        var xhr = new XMLHttpRequest();
+        xhr.open(options.method || 'GET', url);
+        var headers = options.headers;
+        if (headers) {
+          Object.keys(headers).forEach(function (k) {
+            xhr.setRequestHeader(k, headers[k]);
+          });
+        }
+        xhr.responseType = options.responseType || '';
+        xhr.onload = function () {
+          resolve({
+            ok: xhr.status >= 200 && xhr.status < 400,
+            status: xhr.status,
+            json: function () { return Promise.resolve(JSON.parse(xhr.responseText)); },
+            blob: function () { return Promise.resolve(xhr.response || new Blob([xhr.responseText])); }
+          });
+        };
+        xhr.onerror = function () { reject(new Error('XHR network error')); };
+        xhr.send(options.body || null);
+      });
+    }
+
+    function callApi(endpoint, body) {
+      var headers = { 'Content-Type': 'application/json' };
+      if (_authToken) {
+        var token = _authToken;
+        try { token = decodeURIComponent(_authToken); } catch (_e) { }
+        headers.Authorization = 'Bearer ' + token;
+      }
+      return xhrApi(_apiHost + endpoint, {
+        method: 'POST',
+        headers: headers,
+        body: JSON.stringify(body),
+      }).then(function (r) {
+        if (r.status === 401) {
+          sendFlutterMessage({ action: 'signout', arguments: { url: endpoint, source: 'api_401', fromPage: 'feed' } });
+          return Promise.reject(new Error('unauthorized'));
+        }
+        return r;
+      });
+    }
+
+    function callApiGet(endpoint, params) {
+      var qs = '';
+      if (params) {
+        var parts = [];
+        for (var k in params) {
+          if (Object.prototype.hasOwnProperty.call(params, k) && params[k] !== undefined && params[k] !== null) {
+            parts.push(encodeURIComponent(k) + '=' + encodeURIComponent(String(params[k])));
+          }
+        }
+        if (parts.length) qs = '?' + parts.join('&');
+      }
+
+      var headers = { 'Content-Type': 'application/json' };
+      if (_authToken) {
+        var token = _authToken;
+        try { token = decodeURIComponent(_authToken); } catch (_e) { }
+        headers.Authorization = 'Bearer ' + token;
+      }
+
+      return xhrApi(_apiHost + endpoint + qs, {
+        method: 'GET',
+        headers: headers,
+      }).then(function (r) {
+        if (r.status === 401) {
+          sendFlutterMessage({ action: 'signout', arguments: { url: endpoint + qs, source: 'api_401', fromPage: 'feed' } });
+          return Promise.reject(new Error('unauthorized'));
+        }
+        return r;
+      });
+    }
+
+    function callApiBlob(endpoint, body) {
+      var headers = { 'Content-Type': 'application/json' };
+      if (_authToken) {
+        var token = _authToken;
+        try { token = decodeURIComponent(_authToken); } catch (_e) { }
+        headers.Authorization = 'Bearer ' + token;
+      }
+
+      return xhrApi(_apiHost + endpoint, {
+        method: 'POST',
+        headers: headers,
+        body: JSON.stringify(body),
+        responseType: 'blob',
+      }).then(function (r) {
+        if (r.status === 401) {
+          sendFlutterMessage({ action: 'signout', arguments: { url: endpoint, source: 'api_401', fromPage: 'feed' } });
+          return Promise.reject(new Error('unauthorized'));
+        }
+        if (!r.ok) return Promise.reject({ status: r.status, message: 'HTTP ' + r.status });
+        return r.blob();
+      });
+    }
+
+    function uploadBase64ToS3(dataUrl, fileType) {
+      var mimeMatch = dataUrl.match(/data:([^;]+);base64,/);
+      var mimeType = mimeMatch ? mimeMatch[1] : (fileType === 'audio' ? 'audio/webm' : 'image/png');
+      var base64Data = dataUrl.indexOf(',') !== -1 ? dataUrl.split(',')[1] : dataUrl;
+      var ext = mimeType.split('/')[1] || (fileType === 'audio' ? 'webm' : 'png');
+      var uuid = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) {
+        var r = Math.random() * 16 | 0;
+        var v = c === 'x' ? r : (r & 0x3 | 0x8);
+        return v.toString(16);
+      });
+      var folder = fileType === 'audio' ? 'audio' : 'images';
+      var fileName = 'v3-games/dist/' + GAME.game_id + '/' + folder + '/' + uuid + '.' + ext;
+
+      return callApi('/s3/generatePresignedUrl', { fileName: fileName, method: 'put_object' })
+        .then(function (r) { return r.json(); })
+        .then(function (result) {
+          var presignedUrl = (result && result.presignedUrl) ||
+            (result && result.data && result.data.presignedUrl);
+          if (!presignedUrl) return Promise.reject(new Error('No presigned URL returned'));
+
+          var binary = atob(base64Data);
+          var bytes = new Uint8Array(binary.length);
+          for (var i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+
+          return xhrApi(presignedUrl, {
+            method: 'PUT',
+            headers: { 'Content-Type': mimeType },
+            body: bytes.buffer,
+          }).then(function (r) {
+            if (!r.ok) return Promise.reject(new Error('S3 upload failed: ' + r.status));
+            var url = new URL(presignedUrl);
+            return url.origin + url.pathname;
+          });
+        });
+    }
+
+    function extractData(result) {
+      return (result && result.data !== undefined) ? result.data : result;
+    }
+
+    function computeWantMute() {
+      if (document.visibilityState === 'hidden') return true;
+      if (!_isCardVisible) return true;
+      return !!_requestedMuted;
+    }
+
+    function sendAudioStateToIframe(taskId) {
+      var iframe = iframeNode();
+      if (!iframe || !iframe.contentWindow || !_iframeActive) return;
+      iframe.contentWindow.postMessage({
+        origin: 'sekai_gaming_iframe_api',
+        type: _audioMuted ? 'receive_audio_mute' : 'receive_audio_unmute',
+        taskId: taskId || 'shell_audio_state',
+        data: null,
+      }, '*');
+    }
+
+    function clearShellVibrationState() {
+      _lastFlutterVibrationAtMs = 0;
+      try {
+        if (navigator.vibrate) navigator.vibrate(0);
+      } catch (_e) {}
+    }
+
+    function requestShellVibration(payload) {
+      return sendFlutterMessage({
+        action: 'vibrate',
+        data: normalizeShellVibrationPayload(payload),
+      });
+    }
+
+    function stopVibration() {
+      _shellVibrationGateOpen = false;
+      clearShellVibrationState();
+
+      var iframe = iframeNode();
+      if (!iframe || !iframe.contentWindow || !_iframeActive) return;
+      try {
+        iframe.contentWindow.postMessage({
+          type: 'sekai:cancel_vibration',
+        }, '*');
+      } catch (_e) {}
+    }
+
+    function resumeVibration() {
+      _shellVibrationGateOpen = true;
+      var iframe = iframeNode();
+      if (!iframe || !iframe.contentWindow || !_iframeActive) return;
+      try {
+        iframe.contentWindow.postMessage({
+          type: 'sekai:resume_vibration',
+        }, '*');
+      } catch (_e) {}
+    }
+
+    function sendSocialActionToIframe(actionType, content) {
+      var iframe = iframeNode();
+      if (!iframe || !iframe.contentWindow || !_iframeActive || !actionType) return;
+      iframe.contentWindow.postMessage({
+        origin: 'sekai_gaming_iframe_api',
+        type: 'receive_social_action',
+        taskId: 'social_action_' + Date.now(),
+        data: {
+          type: actionType,
+          content: content || undefined,
+        },
+      }, '*');
+    }
+
+    // 键盘高度缓存（逻辑像素）。由 Flutter 通过 window.__sekaiShellKeyboardChange
+    // 推送；shell 不自己监听 visualViewport，因为 didChangeMetrics 走 iOS
+    // UIKeyboardWillShow / Android onApplyWindowInsets，比 visualViewport.resize
+    // 在 iOS 17 上快 600ms+。
+    var _keyboardHeight = 0;
+
+    // ── viewport 广播节流 ──────────────────────────────────────────────────
+    // ResizeObserver 每帧至多一次，但 CSS 动画（overlay 弹出/收起）期间
+    // 每 16ms 一帧 → 1 秒内 60 次 postMessage 洪水，每条经 game_frame →
+    // JavascriptChannel → Flutter 主线程回调，累积占满 event loop 导致
+    // UI 冻结（见 iOS watchdog 0x8BADF00D 事故 2026-05-09）。
+    //
+    // 方案：trailing-edge throttle 100ms。键盘场景（__sekaiShellKeyboardChange）
+    // 绕过节流直接发——键盘动画本身有 didChangeMetrics 去重，且用户输入
+    // 对延迟更敏感。
+    var _vpThrottleTimer = null;
+    var _vpThrottlePending = false;
+
+    function _doSendViewportHeight() {
+      var iframe = iframeNode();
+      if (!iframe || !iframe.contentWindow) return;
+      var area = iframe.closest('.game-area') || iframe.parentElement;
+
+      // 先把 shell 恢复到全尺寸再读 clientHeight —— 关键！
+      // 否则第二次调用时读到的是上次已经 shrunk 的值，再减 _keyboardHeight
+      // 会越减越小直到 0（二阶 bug，动画期间 didChangeMetrics 每帧触发会
+      // 很快把 viewport 压成负数）。
+      document.documentElement.style.height = '';
+      document.body.style.height = '';
+
+      var areaHeight = area ? area.clientHeight : 0;
+      if (areaHeight <= 0) return;
+      var availableHeight = Math.max(0, areaHeight - _keyboardHeight);
+
+      // ── 同步收缩 shell 自身高度 ──────────────────────────────────────────
+      // 必须同时做两件事才能让 input 正确落在键盘上方：
+      // (1) 通知 iframe 内游戏 reflow 到新像素高度（下方 postMessage）
+      // (2) 收缩 shell 的 html/body，让 .game-area (100%) 和 #game-frame
+      //     (position:absolute;inset:0) 一起跟着缩。
+      //
+      // 少做 (2) 的后果（第一版 bug）：iframe 元素本身仍是全尺寸，contentDocument
+      // 被压缩到 availableHeight 后，iframe 元素下方 _keyboardHeight 那段露出
+      // iframe 自己的 background:#000 → 屏幕中部出现一大块黑色，input 卡在黑
+      // 色上沿。
+      //
+      // 收缩 shell 后，iframe 元素跟着到 availableHeight，下方 _keyboardHeight
+      // 露出的是 Flutter 的 ColoredBox(#0B0B10)，而键盘正好盖在那块上，视觉
+      // 上什么都看不见 —— 完美贴合。
+      //
+      // Scaffold.resizeToAvoidBottomInset=false（见 home_page.dart:846），
+      // WebView 容器不会被 Flutter 缩，所以这里只能由 shell 自己收缩。
+      if (_keyboardHeight > 0) {
+        var shrunk = availableHeight + 'px';
+        document.documentElement.style.height = shrunk;
+        document.body.style.height = shrunk;
+      }
+
+      // 键盘未弹起时传 null，让 iframe 走自然 100% 路径，避免把
+      // innerHeight 锁死在某个瞬时值。
+      iframe.contentWindow.postMessage(
+        {
+          type: 'viewport_height_change',
+          height: _keyboardHeight > 0 ? availableHeight : null,
+        },
+        '*'
+      );
+    }
+
+    function sendViewportHeight() {
+      if (_vpThrottleTimer) {
+        _vpThrottlePending = true;
+        return;
+      }
+      _doSendViewportHeight();
+      _vpThrottleTimer = setTimeout(function () {
+        _vpThrottleTimer = null;
+        if (_vpThrottlePending) {
+          _vpThrottlePending = false;
+          _doSendViewportHeight();
+        }
+      }, 100);
+    }
+
+    // 键盘场景绕过节流——延迟敏感，且上游 didChangeMetrics 已自带去重。
+    function sendViewportHeightImmediate() {
+      if (_vpThrottleTimer) {
+        clearTimeout(_vpThrottleTimer);
+        _vpThrottleTimer = null;
+        _vpThrottlePending = false;
+      }
+      _doSendViewportHeight();
+    }
+
+    // Flutter 入口：didChangeMetrics 上报 viewInsets.bottom（逻辑像素）。
+    window.__sekaiShellKeyboardChange = function (heightPx) {
+      var next = Math.max(0, Number(heightPx) || 0);
+      if (Math.abs(next - _keyboardHeight) < 0.5) return;
+      _keyboardHeight = next;
+      sendViewportHeightImmediate();
+    };
+
+    // WebView bounds 变化主动广播 —— 全屏切换 / 设备旋转 / Flutter 侧
+    // AnimatedSize 过渡，shell 的 body 尺寸会随 WebView 重新 layout。
+    // 理论上浏览器会在每一层 iframe 的 contentWindow 派发原生 resize，
+    // 但 iOS WKWebView 的 file:// → file:// → blob: 三层嵌套路径上 resize
+    // 传播并不稳定——游戏 iframe 常常收不到事件，canvas 的像素尺寸
+    // (canvas.width/height) 停在旧值，而 CSS 尺寸随容器拉伸 → 画面糊 +
+    // getBoundingClientRect 坐标错位 → 全屏后"点不动"。
+    //
+    // 解法：shell 用 ResizeObserver 观察自己的 body，是真正的"第一现场"，
+    // 每次尺寸变化就显式 postMessage。iframe 注入脚本在 apply() 末尾
+    // dispatchEvent(new Event('resize'))，把消息转换回 resize 事件，
+    // 游戏原有的 addEventListener('resize', ...) 直接命中，无需改游戏代码。
+    //
+    // 走 sendViewportHeight() 而非 Immediate——CSS 动画期间 ResizeObserver
+    // 每帧触发，100ms throttle 把 60fps 降到 ~10fps，足够游戏 canvas 跟上
+    // 且不淹没 Flutter 主线程。
+    (function () {
+      if (typeof ResizeObserver !== 'function') return;
+      var ro = new ResizeObserver(function () {
+        sendViewportHeight();
+      });
+      ro.observe(document.body);
+    })();
+
+    function syncAudioState(taskId) {
+      var wantMute = computeWantMute();
+      if (wantMute === _audioMuted) return;
+      _audioMuted = wantMute;
+      sendAudioStateToIframe(taskId);
+    }
+
+    function syncAudioStateForce(taskId) {
+      _audioMuted = computeWantMute();
+      sendAudioStateToIframe(taskId);
+    }
+
+    function loadIframe() {
+      var iframe = iframeNode();
+      if (!iframe || _iframeActive || !_isBootstrapped) return;
+      // ─── 预加载即加载（不再 visibility gate）────────────────────────────
+      // 历史上这里有 `if (!_isCardVisible) return` —— 因为旧方案用 display:none
+      // 隐藏，容器 0×0 会让 game resizeCanvas() 崩。
+      // 现方案改用 visibility:hidden（见 applyIframeVisibility），layout 尺寸恒定
+      // 非 0，所以不可见时也能安全加载游戏资源。预加载 next 卡在此把 iframe 拉起来，
+      // 加载后由 applyIframeVisibility / dom_ready 发 sekai:freeze 冻结 rAF/audio，
+      // 等曝光（setVisible(true)）只发 sekai:thaw 即可秒玩，无需冷加载。
+      _iframeActive = true;
+      _iframeLoaded = false;
+      console.log('[NativeFeedShell] loadIframe gameId=' + (GAME.game_id || '') + ' visible=' + _isCardVisible + ' muted=' + _requestedMuted);
+      shellPerf('loadIframe', { visible: _isCardVisible, muted: _requestedMuted });
+      reportIframeLoadState('start');
+      if (isMultiplayerGame()) notifyMpConnectingOnce('metadata');
+      // html_ready = iframe 的 src 已指到 game_frame（拉 HTML 的起点）。
+      // v1 对应 onFeedPerfHtmlReady，用来算 html_fetch_ms。
+      reportPerfEvent('html_ready', null);
+      startDomReadyTimeout();
+      hideLoading();
+      scheduleShowLoadingIfSlow();
+      iframe.src = 'g3_feed_game_frame.html';
+    }
+
+    function unloadIframe() {
+      var iframe = iframeNode();
+      if (!iframe || !_iframeActive) return;
+      _iframeActive = false;
+      _iframeLoaded = false;
+      _lastMiniAppInteractedAt = 0;
+      console.log('[NativeFeedShell] unloadIframe gameId=' + (GAME.game_id || ''));
+      clearDomReadyTimeout();
+      hideLoading();
+      iframe.src = 'about:blank';
+    }
+
+    function setVisible(visible) {
+      _isCardVisible = !!visible;
+      console.log('[NativeFeedShell] setVisible gameId=' + (GAME.game_id || '') + ' visible=' + _isCardVisible);
+      shellPerf('setVisible', { visible: _isCardVisible });
+      if (!_isCardVisible) stopVibration();
+      applyIframeVisibility();
+      // 预加载也加载 iframe 资源：不可见时 loadIframe 仍执行，加载后保持 freeze
+      // （applyIframeVisibility + dom_ready 发 sekai:freeze）；曝光时此调用因
+      // _iframeActive 已 true 而 no-op，只走下面的 thaw 路径，实现秒玩。
+      loadIframe();
+      if (_isCardVisible) {
+        if (!_authToken) {
+          _pageReadyRetries = 0;
+          tryPageReady();
+        }
+        resumeVibration();
+        // Pre-load race fix: dom_ready fired before card was exposed, so
+        // Flutter had no session to receive it. Re-emit now that the session
+        // has been (or is about to be) created on card expose.
+        if (_iframeLoaded) reportPerfEvent('dom_ready', null);
+      }
+      syncAudioState('visibility_change');
+    }
+
+    function setMuted(muted) {
+      _requestedMuted = !!muted;
+      console.log('[NativeFeedShell] setMuted gameId=' + (GAME.game_id || '') + ' muted=' + _requestedMuted);
+      syncAudioState('shell_set_muted');
+    }
+
+    function bootstrap(payload) {
+      payload = payload || {};
+
+      GAME = payload.cardData || {};
+      _isBootstrapped = true;
+      _isLiked = !!GAME.is_liked;
+      _isSaved = !!GAME.is_saved;
+      _likeCount = GAME.like_count || 0;
+      _commentCount = GAME.comment_count || 0;
+      _saveCount = GAME.save_count || 0;
+      _requestedMuted = !!payload.isMuted;
+      _lastMiniAppInteractedAt = 0;
+      console.log('[NativeFeedShell] bootstrap gameId=' + (GAME.game_id || '') + ' active=' + (!!payload.isActive) + ' muted=' + _requestedMuted);
+      shellPerfReset('bootstrap', { active: !!payload.isActive, muted: _requestedMuted });
+      // 不在 bootstrap 阶段无条件 loadIframe。loadIframe 现在收敛到「可见态」
+      // 一条路径：setVisible(true) 内部会触发；远端预绑定（active=false）只
+      // 准备 GAME 状态，等首次曝光再加载，确保容器尺寸非 0。
+      setVisible(!!payload.isActive);
+
+      if (_isCardVisible) {
+        postBootstrapToFrame();
+      }
+    }
+
+    // Flutter 评论面板 authors header：对齐 consumeG3FeedData + creatorCache 下过卡的字段
+    function buildGameInfoForCommentPanel() {
+      var g = GAME || {};
+      var rawId = g.creator_id != null ? g.creator_id : g.creator_user_id;
+      var creatorIdNum = typeof rawId === 'number' ? rawId : parseInt(String(rawId || ''), 10);
+      var extra = {};
+      try {
+        if (g.extra && typeof g.extra === 'object') {
+          var keys = Object.keys(g.extra);
+          for (var i = 0; i < keys.length; i++) {
+            var k = keys[i];
+            extra[k] = g.extra[k];
+          }
+        }
+      } catch (_e) {}
+      if (isFinite(creatorIdNum) && creatorIdNum > 0) {
+        extra.creator_id = creatorIdNum;
+      }
+      var payload = {
+        game_id: g.game_id || '',
+        title: g.title || '',
+        creator_name: g.creator_name || '',
+        creator_avatar: g.creator_avatar || '',
+        extra: extra,
+      };
+      if (isFinite(creatorIdNum) && creatorIdNum > 0) {
+        payload.creator_id = creatorIdNum;
+      }
+      return payload;
+    }
+
+    // ── notifyMpConnecting (SEK-6941) ──────────────────────────────────────
+    // Flutter 侧 MultiplayerReadyTracker 需要在 game module evaluate 之前
+    // 收到 notifyMpConnecting，才能兜底 catch 住 Paper Wars 类 ES module
+    // fail-stop（iframe 内 0 行执行 → 所有 Agora 埋点 never fire）。
+    // 按 gameId 去重，避免 setVisible 切换 / retry 重复启动 tracker。
+    var _mpConnectingNotified = {};
+
+    function isMultiplayerGame() {
+      return GAME.type === 'multiplayer' ||
+        GAME.game_type === 'multiplayer' ||
+        !!GAME.is_multiplayer;
+    }
+
+    function notifyMpConnectingOnce(source) {
+      var gid = GAME.game_id;
+      if (!gid || _mpConnectingNotified[gid]) return;
+      _mpConnectingNotified[gid] = true;
+      console.log('[NativeFeedShell] notifyMpConnecting gameId=' + gid + ' source=' + source);
+      sendFlutterMessage({
+        action: 'notifyMpConnecting',
+        data: { gameId: gid, fromPage: 'feed' },
+      });
+    }
+
+    // ── multiplayer (Agora RTM via Flutter bridge) ─────────────────────────
+    // 精简移植自 v1-revamp 的 useAgoraMultiplayer.ts / useMultiplayerHandlers.ts。
+    // 不移植会导致：iframe 里的 ONLINE 多人游戏调 multiplayer_get_session 后
+    // 被 shell 直接拒掉 "Multiplayer not supported"，Feed 入口必 fail，
+    // 对应 Linear SEK-6672（Meme Ascent / Glow Ball I.S 都复现）。
+    //
+    // 核心职责：
+    //   1. 把 iframe 的 multiplayer_* 消息转成 Flutter agoraEnterGame /
+    //      agoraSyncMessage 请求（通过 sendFlutterMessage -> messageHandler）；
+    //   2. 消化 Flutter 侧推回来的 agoraJoinedChannel / agoraLeftChannel /
+    //      agoraSyncMessage / agoraConnectionStateChanged 事件，forward 给 iframe；
+    //   3. 处理 Agora RTM login race：agoraEnterGame 3 次重试 + 1s 延迟（对齐
+    //      web 侧实现，Marco 4/16 在 daily 提到过）；
+    //   4. getSession 去重：已进入的直接返回缓存，进行中的拒绝重复请求
+    //      （Android iframe 会发双次 multiplayer_get_session）。
+    var mp = {
+      entered: false,
+      entering: false,
+      channelName: null,
+      selfPlayerId: null,
+      selfPlayerName: null,
+      selfPlayerAvatar: null,
+      players: {}, // playerId -> { playerId, playerName, playerAvatar }
+    };
+
+    function mpLog(msg, extra) {
+      var line = '[NativeFeedShell][mp] ' + msg + ' gameId=' + (GAME.game_id || '');
+      if (extra) {
+        try { line += ' ' + JSON.stringify(extra); } catch (_e) { }
+      }
+      console.log(line);
+    }
+
+    // Post reply 给 iframe —— 与 message listener 内的 reply() 行为完全一致，
+    // 抽出来是为了让异步的 mp handlers 也能调用（原 reply 是 listener 闭包）。
+    function postReplyToIframe(taskId, type, payload, errCode, errMsg) {
+      var iframe = iframeNode();
+      if (!iframe || !iframe.contentWindow) return;
+      var msg = {
+        origin: 'sekai_gaming_iframe_api',
+        type: type,
+        taskId: taskId,
+      };
+      if (errCode) {
+        msg.data = null;
+        msg.error = { code: errCode, message: errMsg || 'Error' };
+      } else {
+        msg.data = payload !== undefined ? payload : null;
+      }
+      iframe.contentWindow.postMessage(msg, '*');
+    }
+
+    // 事件 forward（Flutter agora 事件 -> iframe 游戏 HTML）。
+    // taskId 用 'mp_' 前缀 + 时间戳，对 iframe 来说只是个推送事件，不等 reply。
+    function mpForwardToIframe(type, data) {
+      var iframe = iframeNode();
+      if (!iframe || !iframe.contentWindow || !_iframeActive) return;
+      iframe.contentWindow.postMessage({
+        origin: 'sekai_gaming_iframe_api',
+        type: type,
+        taskId: 'mp_' + Date.now(),
+        data: data,
+      }, '*');
+    }
+
+    // Agora SDK 状态 -> web 侧约定的三元组。与 useAgoraMultiplayer.ts:115 对齐。
+    function mpMapConnectionState(raw) {
+      var s = String(raw || '').toUpperCase();
+      if (s === 'CONNECTED') return 'connected';
+      if (s === 'RECONNECTING' || s === 'CONNECTING') return 'reconnecting';
+      return 'disconnected';
+    }
+
+    // 通过 /user/v2/getUserInfo 补全 player 的 name / avatar。numeric userId
+    // 才走后端查询；非数字 fallback 为 id 本身（guest / system 用户）。
+    function mpFetchUserInfo(userId) {
+      var idStr = String(userId || '');
+      if (!idStr) return Promise.resolve({ playerId: '', playerName: '', playerAvatar: '' });
+      var n = Number(idStr);
+      if (!isFinite(n) || String(n) !== idStr) {
+        return Promise.resolve({ playerId: idStr, playerName: idStr, playerAvatar: '' });
+      }
+      return callApiGet('/user/v2/getUserInfo', { userId: idStr })
+        .then(function (r) { return r.json(); })
+        .then(function (result) {
+          var user = result && result.data && result.data.user;
+          return {
+            playerId: idStr,
+            playerName: (user && user.userName) || idStr,
+            playerAvatar: (user && user.avatarUrl) || '',
+          };
+        })
+        .catch(function () {
+          return { playerId: idStr, playerName: idStr, playerAvatar: '' };
+        });
+    }
+
+    // 兜底 parser —— flutter_inappwebview 一般已反序列化为 object，但 iOS 某些
+    // 版本 / 错误路径可能回 string。保险起见两种都能吞。
+    function mpParseBridgeResponse(res) {
+      if (res == null) return null;
+      if (typeof res === 'string') {
+        try { return JSON.parse(res); } catch (_e) { return null; }
+      }
+      return res;
+    }
+
+    // sendFlutterMessage 底层是 flutter_inappwebview.callHandler，返回 Promise。
+    // 包一层拿到 Dart 侧 HybridAgora.handleAgoraXxx 的返回值。
+    function mpSendFlutterAgora(action, data) {
+      return new Promise(function (resolve) {
+        try {
+          var result = sendFlutterMessage({ action: action, data: data });
+          if (result && typeof result.then === 'function') {
+            result.then(function (res) { resolve(res); }, function (err) {
+              mpLog('bridge call error action=' + action, { error: String(err) });
+              resolve(null);
+            });
+          } else {
+            resolve(result);
+          }
+        } catch (e) {
+          mpLog('bridge call threw action=' + action, { error: String(e) });
+          resolve(null);
+        }
+      });
+    }
+
+    // agoraEnterGame 3 次重试 + 1s 延迟。对齐 useAgoraMultiplayer.ts:348-385。
+    // 首次进入时 Flutter 的 RTM 可能还在 idle，直接 enter 很容易失败；重试吸收
+    // 这个竞态。这是 Marco 4/16 在 daily standup 讲过的 "第一次 enter game 失败"
+    // 问题的 fix。
+    function mpEnterGameWithRetry() {
+      if (!GAME.game_id || !_userId) {
+        return Promise.resolve(null);
+      }
+      var MAX = 3;
+      var DELAY = 1000;
+      var attempt = 0;
+      function once() {
+        attempt += 1;
+        return mpSendFlutterAgora('agoraEnterGame', {
+          gameId: GAME.game_id,
+          userId: String(_userId),
+        }).then(function (raw) {
+          var parsed = mpParseBridgeResponse(raw);
+          mpLog('agoraEnterGame attempt=' + attempt, {
+            success: parsed && parsed.success,
+            channelName: parsed && parsed.channelName,
+            memberCount: parsed && parsed.members && parsed.members.length,
+          });
+          if (parsed && parsed.success && parsed.channelName) return parsed;
+          if (attempt >= MAX) return parsed || null;
+          return new Promise(function (resolve) {
+            setTimeout(function () { resolve(once()); }, DELAY);
+          });
+        });
+      }
+      return once();
+    }
+
+    function mpBuildSessionPayload() {
+      var selfId = mp.selfPlayerId || (_userId ? String(_userId) : '');
+      var playersArr = [];
+      for (var k in mp.players) {
+        if (Object.prototype.hasOwnProperty.call(mp.players, k)) {
+          playersArr.push(mp.players[k]);
+        }
+      }
+      return {
+        sessionId: mp.channelName,
+        playerId: selfId,
+        playerName: mp.selfPlayerName || selfId,
+        playerAvatar: mp.selfPlayerAvatar || '',
+        players: playersArr,
+        maxPlayers: 10,
+      };
+    }
+
+    function mpHandleGetSession(taskId) {
+      notifyMpConnectingOnce('iframe_requested');
+      // Cached: 已经 enter 成功，直接返回现有 session，避免重复占用 Agora session。
+      if (mp.entered && mp.channelName) {
+        mpLog('getSession returning cached session');
+        postReplyToIframe(taskId, 'multiplayer_receive_session', mpBuildSessionPayload());
+        return;
+      }
+      // In-flight: 同一 getSession 还在执行中，拒绝 duplicate（Android iframe
+      // 会发双次，v1-revamp 里对齐的保护，useAgoraMultiplayer.ts:330）。
+      if (mp.entering) {
+        mpLog('getSession rejected: already in flight');
+        postReplyToIframe(
+          taskId,
+          'multiplayer_receive_session',
+          null,
+          409,
+          'Session entry already in progress'
+        );
+        return;
+      }
+      if (!GAME.game_id) {
+        postReplyToIframe(taskId, 'multiplayer_receive_session', null, 400, 'Missing gameId');
+        return;
+      }
+      if (!_userId) {
+        postReplyToIframe(taskId, 'multiplayer_receive_session', null, 401, 'User not authenticated');
+        return;
+      }
+
+      mp.entering = true;
+      mpEnterGameWithRetry()
+        .then(function (response) {
+          if (!response || !response.success || !response.channelName) {
+            mpLog('getSession failed after retries', { response: response });
+            postReplyToIframe(
+              taskId,
+              'multiplayer_receive_session',
+              null,
+              500,
+              'Failed to enter game session'
+            );
+            return null;
+          }
+          mp.channelName = response.channelName;
+          mp.entered = true;
+          var members = (response.members && response.members.length)
+            ? response.members
+            : [String(_userId)];
+          var selfId = String(_userId);
+
+          return Promise.all(members.map(mpFetchUserInfo)).then(function (infos) {
+            mp.players = {};
+            for (var i = 0; i < infos.length; i++) {
+              var info = infos[i];
+              if (info && info.playerId) {
+                mp.players[info.playerId] = info;
+              }
+            }
+            // 自己兜底（如果 Presence 没把 self 带回来）
+            if (!mp.players[selfId]) {
+              mp.players[selfId] = {
+                playerId: selfId,
+                playerName: selfId,
+                playerAvatar: '',
+              };
+            }
+            mp.selfPlayerId = selfId;
+            mp.selfPlayerName = mp.players[selfId].playerName;
+            mp.selfPlayerAvatar = mp.players[selfId].playerAvatar;
+            mpLog('getSession success', {
+              channel: mp.channelName,
+              playerCount: Object.keys(mp.players).length,
+            });
+            postReplyToIframe(taskId, 'multiplayer_receive_session', mpBuildSessionPayload());
+          });
+        })
+        .catch(function (err) {
+          mpLog('getSession exception', { error: String(err) });
+          postReplyToIframe(taskId, 'multiplayer_receive_session', null, 500, 'Failed to get session');
+        })
+        .then(function () { mp.entering = false; });
+    }
+
+    function mpHandleGetPlayers(taskId) {
+      var playersArr = [];
+      for (var k in mp.players) {
+        if (Object.prototype.hasOwnProperty.call(mp.players, k)) {
+          playersArr.push(mp.players[k]);
+        }
+      }
+      postReplyToIframe(taskId, 'multiplayer_receive_players', { players: playersArr });
+    }
+
+    function mpHandleSendData(payload) {
+      if (!mp.channelName || !payload) return;
+      var bridgeData = { channelName: mp.channelName, msg: payload.payload };
+      if (payload.target) bridgeData.customType = String(payload.target);
+      sendFlutterMessage({ action: 'agoraSyncMessage', data: bridgeData });
+    }
+
+    function mpBridgeCall(action, data) {
+      return new Promise(function (resolve) {
+        try {
+          var result = sendFlutterMessage({ action: action, data: data || {} });
+          if (result && typeof result.then === 'function') {
+            result.then(function (res) { resolve(res); }, function (err) {
+              resolve({ success: false, error: String(err) });
+            });
+          } else {
+            resolve(result);
+          }
+        } catch (e) {
+          resolve({ success: false, error: String(e) });
+        }
+      }).then(mpParseBridgeResponse);
+    }
+
+    function mpHandleCreateAppPrivateSession(taskId, payload) {
+      if (!GAME.game_id || !GAME.version_id) {
+        postReplyToIframe(taskId, 'receive_create_app_private_session', null, 400, 'Missing gameId or versionId');
+        return;
+      }
+      var bridgeData = {
+        gameId: GAME.game_id,
+        versionId: GAME.version_id,
+      };
+      if (payload && payload.appStates) bridgeData.appStates = payload.appStates;
+      mpBridgeCall('appSessionCreate', bridgeData).then(function (res) {
+        if (res && res.success && res.sessionCode) {
+          postReplyToIframe(taskId, 'receive_create_app_private_session', {
+            sessionCode: res.sessionCode,
+            appStates: res.appStates || { pageSettings: {}, sekaiSettings: { userPrompt: '' } },
+          });
+          return;
+        }
+        var code = (res && res.code) || 500;
+        var msg = (res && res.error) || 'Failed to create session';
+        postReplyToIframe(taskId, 'receive_create_app_private_session', null, code, msg);
+      });
+    }
+
+    function mpHandleJoinAppPrivateSession(taskId, payload) {
+      if (!GAME.game_id || !GAME.version_id) {
+        postReplyToIframe(taskId, 'receive_join_app_private_session', null, 400, 'Missing gameId or versionId');
+        return;
+      }
+      var sessionCode = payload && payload.sessionCode ? String(payload.sessionCode) : '';
+      if (!sessionCode) {
+        postReplyToIframe(taskId, 'receive_join_app_private_session', null, 400, 'Missing sessionCode');
+        return;
+      }
+      mpBridgeCall('appSessionJoin', {
+        gameId: GAME.game_id,
+        versionId: GAME.version_id,
+        sessionCode: sessionCode,
+      }).then(function (res) {
+        if (res && res.success && res.sessionCode) {
+          postReplyToIframe(taskId, 'receive_join_app_private_session', {
+            sessionCode: res.sessionCode,
+            appStates: res.appStates || { pageSettings: {}, sekaiSettings: { userPrompt: '' } },
+          });
+          return;
+        }
+        var code = (res && res.code) || 500;
+        var msg = (res && res.error) || 'Failed to join session';
+        postReplyToIframe(taskId, 'receive_join_app_private_session', null, code, msg);
+      });
+    }
+
+    function mpHandleGetAppPrivateSessions(taskId) {
+      if (!GAME.game_id || !GAME.version_id) {
+        postReplyToIframe(taskId, 'receive_app_private_sessions', null, 400, 'Missing gameId or versionId');
+        return;
+      }
+      mpBridgeCall('appSessionList', {
+        gameId: GAME.game_id,
+        versionId: GAME.version_id,
+      }).then(function (res) {
+        if (res && res.success) {
+          postReplyToIframe(taskId, 'receive_app_private_sessions', res.sessions || []);
+          return;
+        }
+        var code = (res && res.code) || 500;
+        var msg = (res && res.error) || 'Failed to list sessions';
+        postReplyToIframe(taskId, 'receive_app_private_sessions', null, code, msg);
+      });
+    }
+
+    // ── Agora 事件处理（Flutter 推 -> shell -> iframe）──────────────────────
+    function mpHandleAgoraJoined(data) {
+      var joinedId = String(data && data.userId || '');
+      if (!joinedId) return;
+      mpLog('agoraJoinedChannel', { joinedId: joinedId });
+      // 先放个 stub，避免 getUserInfo 未返回时状态不一致。
+      if (!mp.players[joinedId]) {
+        mp.players[joinedId] = { playerId: joinedId, playerName: joinedId, playerAvatar: '' };
+      }
+      mpFetchUserInfo(joinedId).then(function (info) {
+        // 若已离开，不再更新 —— 防止 race 产生幽灵 player。
+        if (!mp.players[joinedId]) return;
+        mp.players[joinedId] = info;
+        mpForwardToIframe('multiplayer_player_joined', info);
+      });
+    }
+
+    function mpHandleAgoraLeft(data) {
+      var leftId = String(data && data.userId || '');
+      if (!leftId) return;
+      mpLog('agoraLeftChannel', { leftId: leftId });
+      delete mp.players[leftId];
+      mpForwardToIframe('multiplayer_player_left', { playerId: leftId, reason: 'left' });
+    }
+
+    function mpHandleAgoraSyncMessage(data) {
+      if (!data) return;
+      mpForwardToIframe('multiplayer_receive_data', {
+        fromPlayerId: data.publisherId,
+        payload: data.msg,
+        timestamp: data.timestamp || Date.now(),
+      });
+    }
+
+    function mpHandleAgoraConnectionState(data) {
+      if (!data) return;
+      mpForwardToIframe('multiplayer_connection_state_changed', {
+        state: mpMapConnectionState(data.state),
+      });
+    }
+
+    // 卡片退场 / 切换游戏时本地清空 + 通知 Flutter 退出 Agora channel，
+    // 避免 session 泄漏（否则切到下一张卡时旧 channel 还在订阅）。
+    function mpReset(reason) {
+      if (mp.entered && mp.channelName && GAME.game_id) {
+        mpLog('mpReset -> agoraLeaveGame', { reason: reason, channel: mp.channelName });
+        sendFlutterMessage({
+          action: 'agoraLeaveGame',
+          data: { gameId: GAME.game_id },
+        });
+      }
+      mp.entered = false;
+      mp.entering = false;
+      mp.channelName = null;
+      mp.selfPlayerId = null;
+      mp.selfPlayerName = null;
+      mp.selfPlayerAvatar = null;
+      mp.players = {};
+    }
+
+    // ── shell 公开 API ───────────────────────────────────────────────────────
+    // setState: 原子更新可见性 + 静音状态，避免两次独立消息产生的竞态窗口。
+    // forceStop: 退场路径专用——强制静音后立即 unload iframe，
+    //            确保卡片销毁前音频已停止，防止 BGM 泄漏到后续 card。
+    //
+    // iOS WKWebView 里 DeviceMotionEvent.requestPermission 不可用、传感器事件
+    // 也不会 fire。Flutter 端通过 sensors_plus 直接订阅加速度 / 陀螺仪，调
+    // pushMotion / pushOrientation 把样本逐帧注入 shell；shell 再 forward 给
+    // game-frame（它在 message handler 的默认分支把非白名单消息一律 postToChild，
+    // 最终送达游戏 iframe 内注入的 receiver 脚本）。节流由 Flutter 侧控制。
+    function pushMotionToFrame(data) {
+      var iframe = iframeNode();
+      if (!iframe || !iframe.contentWindow || !_iframeActive || !_isCardVisible || !data) return;
+      iframe.contentWindow.postMessage({
+        type: '__sekai_device_motion__',
+        acceleration: data.acceleration || null,
+        accelerationIncludingGravity: data.accelerationIncludingGravity || null,
+        rotationRate: data.rotationRate || null,
+        interval: data.interval || 16,
+        timestamp: data.timestamp || Date.now(),
+      }, '*');
+    }
+
+    function pushOrientationToFrame(data) {
+      var iframe = iframeNode();
+      if (!iframe || !iframe.contentWindow || !_iframeActive || !_isCardVisible || !data) return;
+      iframe.contentWindow.postMessage({
+        type: '__sekai_device_orientation__',
+        alpha: data.alpha == null ? null : data.alpha,
+        beta: data.beta == null ? null : data.beta,
+        gamma: data.gamma == null ? null : data.gamma,
+        absolute: !!data.absolute,
+        timestamp: data.timestamp || Date.now(),
+      }, '*');
+    }
+
+    window.__sekaiFeedShell = {
+      bootstrap: bootstrap,
+      setVisible: setVisible,
+      setMuted: setMuted,
+      pushMotion: pushMotionToFrame,
+      pushOrientation: pushOrientationToFrame,
+      setState: function (payload) {
+        if (!payload) return;
+        console.log(
+          '[NativeFeedShell] setState gameId=' + (GAME.game_id || '') +
+          ' visible=' + payload.isVisible +
+          ' muted=' + payload.isMuted
+        );
+        if (typeof payload.isMuted === 'boolean') {
+          var wasMuted = _requestedMuted;
+          _requestedMuted = !!payload.isMuted;
+          // 预加载 neighbor → 前台 promote：去掉可能残留的 delayed spinner
+          if (wasMuted && !payload.isMuted) {
+            hideLoading();
+          }
+        }
+        if (typeof payload.isVisible === 'boolean') {
+          _isCardVisible = !!payload.isVisible;
+          if (!_isCardVisible) stopVibration();
+          applyIframeVisibility();
+          // 预加载也加载资源（同 setVisible）：曝光时 loadIframe no-op，只 thaw。
+          loadIframe();
+          if (_isCardVisible) {
+            if (!_authToken) { _pageReadyRetries = 0; tryPageReady(); }
+            resumeVibration();
+            // Pre-load race fix: same as setVisible — re-emit dom_ready so
+            // Flutter's new session (created on expose) captures the signal.
+            if (_iframeLoaded) reportPerfEvent('dom_ready', null);
+          }
+        }
+        syncAudioStateForce('set_state');
+      },
+      forceStop: function () {
+        console.log('[NativeFeedShell] forceStop gameId=' + (GAME.game_id || ''));
+        _requestedMuted = true;
+        _audioMuted = true;
+        stopVibration();
+        sendAudioStateToIframe('force_stop');
+        unloadIframe();
+        mpReset('force_stop');
+      },
+      stopVibration: stopVibration,
+      reload: function () {
+        unloadIframe();
+        setTimeout(function () { loadIframe(); }, 0);
+      },
+      // 原子化切换游戏：先停止当前内容，重置状态，再 bootstrap 新游戏。
+      // 用于 WebView 池复用同一个 WebView 实例加载不同游戏。
+      switchGame: function (payload) {
+        payload = payload || {};
+        var nextCard = payload.cardData || {};
+        var nextGameId = nextCard.game_id || '';
+        console.log(
+          '[NativeFeedShell] switchGame from=' + (GAME.game_id || '') +
+          ' to=' + nextGameId +
+          ' active=' + (!!payload.isActive) +
+          ' muted=' + (!!payload.isMuted)
+        );
+        // 同 game 已加载：LRU 重绑/back-swipe 时跳过 unload→reload，只 sync 可见性/静音。
+        if (
+          nextGameId &&
+          nextGameId === GAME.game_id &&
+          _iframeLoaded &&
+          _iframeActive
+        ) {
+          shellPerf('switchGame:skip-same-game', { gameId: nextGameId });
+          if (typeof payload.isMuted === 'boolean') _requestedMuted = !!payload.isMuted;
+          window.__sekaiFeedShell.setState({
+            isVisible: !!payload.isActive,
+            isMuted: !!payload.isMuted,
+          });
+          return;
+        }
+        _requestedMuted = true;
+        _audioMuted = true;
+        stopVibration();
+        sendAudioStateToIframe('switch_game_stop');
+        unloadIframe();
+        // mpReset 必须在 bootstrap(payload) 前 —— bootstrap 会改写 GAME.game_id，
+        // 到时候 agoraLeaveGame 就发错 gameId 了。
+        mpReset('switch_game');
+        _isBootstrapped = false;
+        _firstIframeLoadReported = false;
+        _uploadCache = {};
+        bootstrap(payload);
+      },
+    };
+
+    function handleFlutterMessage(detail) {
+      if (!detail) return;
+      if (detail.data && detail.data.accessToken) _authToken = detail.data.accessToken;
+      if (detail.data && detail.data.isTourist != null) _isTourist = !!detail.data.isTourist;
+      if (detail.data && detail.data.userId) _userId = detail.data.userId;
+      if (detail.data && detail.data.host) {
+        var host = detail.data.host || '';
+        var appUrl = detail.data.appUrl || '';
+        if (host && host.charAt(host.length - 1) === '/') host = host.slice(0, -1);
+        if (appUrl && appUrl.charAt(appUrl.length - 1) === '/') appUrl = appUrl.slice(0, -1);
+        _apiHost = host;
+        _appUrl = appUrl || _apiHost.replace('-api.', '.').replace('://api.', '://');
+      }
+      if (detail.action === 'visibilityChange' || detail.action === 'visibility_change') {
+        setVisible(detail.data && detail.data.isVisible);
+      }
+      if (detail.action === 'receive_social_action') {
+        sendSocialActionToIframe(
+          detail.data && detail.data.type,
+          detail.data && detail.data.content
+        );
+      }
+      if (detail.action === 'pageReady' && _isCardVisible) {
+        loadIframe();
+        postBootstrapToFrame();
+        syncAudioStateForce('page_ready');
+      }
+      // Agora 多人实时事件（Flutter -> shell -> iframe）。对齐 v1-revamp
+      // flutterBridgeRegistry 的 agora 回调，Flutter 侧 sender 见
+      // un_hybrid_ability_manager+toH5.dart 的 sendAgoraXxx。
+      if (detail.action === 'agoraJoinedChannel') {
+        mpHandleAgoraJoined(detail.data);
+      }
+      if (detail.action === 'agoraLeftChannel') {
+        mpHandleAgoraLeft(detail.data);
+      }
+      if (detail.action === 'agoraSyncMessage') {
+        mpHandleAgoraSyncMessage(detail.data);
+      }
+      if (detail.action === 'agoraConnectionStateChanged') {
+        mpHandleAgoraConnectionState(detail.data);
+      }
+      // g3FullScreen: share-panel 点"Full Screen"后，shell 把意图转成
+      // Flutter 侧的 nativeFeedToggleFullscreen 消息，由原生 page 接管
+      // 全屏动画（见 UnG3FeedNativeShellPage._enterFullscreen / _isFullscreen）。
+      // 埋点带 container: 'newFeed' 区分 native feed 入口。
+      if (detail.action === 'g3FullScreen') {
+        sendFlutterMessage({
+          action: 'logEvent',
+          parameters: {
+            eventName: 'share_panel_click_fullscreen',
+            contentId: GAME.game_id || '',
+            contentType: 'g3_game',
+            fromPage: 'feed',
+            container: 'newFeed',
+          },
+        });
+        sendFlutterMessage({
+          action: 'nativeFeedToggleFullscreen',
+          data: {
+            enabled: true,
+            gameId: GAME.game_id || '',
+          },
+        });
+      }
+      if (detail.action === 'g3Feedback') {
+        sendFlutterMessage({
+          action: 'logEvent',
+          parameters: {
+            eventName: 'share_panel_click_feedback',
+            contentId: GAME.game_id || '',
+            contentType: 'g3_game',
+            fromPage: 'feed',
+            container: 'newFeed',
+          },
+        });
+        sendFlutterMessage({
+          action: 'showFeedback',
+          arguments: {
+            fromPage: 'g3-game',
+            content: '',
+            provider: 'g3_feed',
+            content_id: GAME.game_id || '',
+          },
+        });
+      }
+      if (detail.action === 'g3Download') {
+        sendFlutterMessage({
+          action: 'logEvent',
+          parameters: {
+            eventName: 'share_panel_click_download',
+            contentId: GAME.game_id || '',
+            contentType: 'g3_game',
+            fromPage: 'feed',
+            container: 'newFeed',
+          },
+        });
+        sendFlutterMessage({
+          action: 'g3Download',
+          arguments: {
+            gameId: GAME.game_id || '',
+            fromPage: 'feed',
+          },
+        });
+      }
+    }
+
+    window.addEventListener('flutterMessage', function (event) {
+      try {
+        var detail = typeof event.detail === 'string' ? JSON.parse(event.detail) : event.detail;
+        handleFlutterMessage(detail);
+      } catch (_e) { }
+    });
+
+    window.addEventListener('message', function (event) {
+      var data = event.data;
+      if (typeof data === 'string') {
+        try { data = JSON.parse(data); } catch (_e) { return; }
+      }
+      if (!data) return;
+
+      if (data.type === 'sekai:camera_parent_request') {
+        var cf = iframeNode();
+        if (!cf || event.source !== cf.contentWindow) return;
+        var reqId = data.id;
+        var constraints = data.constraints || { video: true };
+        var deliverCamera = function(ok, stream, errName, errMsg) {
+          try {
+            cf.contentWindow.postMessage({
+              type: 'sekai:camera_parent_response',
+              id: reqId,
+              ok: !!ok,
+              stream: stream || null,
+              errorName: errName || null,
+              errorMessage: errMsg || null,
+            }, '*');
+          } catch (_e) {}
+        };
+        shellPerf('camera_parent_request', { hasMediaDevices: !!navigator.mediaDevices });
+        if (navigator.mediaDevices && typeof navigator.mediaDevices.getUserMedia === 'function') {
+          navigator.mediaDevices.getUserMedia(constraints).then(function(stream) {
+            shellPerf('camera_parent_success', null);
+            deliverCamera(true, stream, null, null);
+          }).catch(function(err) {
+            shellPerf('camera_parent_error', { name: (err && err.name) || '', message: (err && err.message) || '' });
+            deliverCamera(false, null, (err && err.name) || 'NotAllowedError', (err && err.message) || 'Permission denied');
+          });
+        } else {
+          shellPerf('camera_parent_error', { name: 'NotSupportedError', message: 'mediaDevices not available' });
+          deliverCamera(false, null, 'NotSupportedError', 'mediaDevices not available');
+        }
+        return;
+      }
+
+      if (data.type === 'viewport_ready') {
+        var vf = iframeNode();
+        if (!vf || event.source !== vf.contentWindow) return;
+        shellPerf('viewport_ready', null);
+        sendViewportHeight();
+        return;
+      }
+
+      if (data.type === 'sekai_feed_frame_perf') {
+        // 来自 g3_feed_game_frame.html 的 perf 透传，对齐 frame + shell 时间轴。
+        shellPerfFromFrame(data);
+        return;
+      }
+
+      // RFC-003 JS prelude 上报：当 iframe 内 __sekaiGuard 跨过 64MB 阈值时
+      // postMessage 到 shell（window.top），shell 转发到 Dart 做 bsd_js_alloc_high 埋点。
+      if (data.type === 'sekai:js_alloc_high') {
+        try {
+          sendFlutterMessage({
+            action: 'jsAllocHigh',
+            data: {
+              warn_mb: data.warn_mb || 0,
+              stats: data.stats || {},
+              game_id: (GAME && GAME.game_id) || '',
+            },
+          });
+        } catch (_e) {}
+        return;
+      }
+
+      // RFC-003 prelude install ack：每个 iframe (含 nested blob) 装上 prelude 后
+      // 立刻 emit。Dart 端用于验证 forMainFrameOnly:false 是否真覆盖到 nested frame。
+      if (data.type === 'sekai:guard_installed') {
+        try {
+          sendFlutterMessage({
+            action: 'guardInstalled',
+            data: {
+              frame_url: data.frame_url || '',
+              cap_mb: data.cap_mb || 0,
+              enforce: !!data.enforce,
+              game_id: (GAME && GAME.game_id) || '',
+            },
+          });
+        } catch (_e) {}
+        return;
+      }
+
+      // Silent-death watchdog 心跳：无条件每 2s 来一条，仅证明 renderer
+      // event loop 活着（不依赖 performance.memory，Android WebView 也能跑）。
+      if (data.type === 'sekai:heartbeat') {
+        try {
+          sendFlutterMessage({
+            action: 'heartbeat',
+            data: {
+              frame_url: data.frame_url || '',
+              is_top: data.is_top || 0,
+              ts: data.ts || 0,
+              game_id: (GAME && GAME.game_id) || '',
+            },
+          });
+        } catch (_e) {}
+        return;
+      }
+
+      // ADR-001 · performance.memory 轮询上报：renderer 内 V8 heap usedJSHeapSize。
+      // 每 2s 来一条，shell 转发 Dart，按 active slot 归因后 N2 判定 hardKill。
+      // 这是 hardKill 的主内存信号（绕过 native UID 墙）。
+      if (data.type === 'sekai:js_heap') {
+        try {
+          sendFlutterMessage({
+            action: 'jsHeapSample',
+            data: {
+              used_mb: data.used_mb || 0,
+              limit_mb: data.limit_mb || 0,
+              frame_url: data.frame_url || '',
+              is_top: data.is_top || 0,
+              game_id: (GAME && GAME.game_id) || '',
+            },
+          });
+        } catch (_e) {}
+        return;
+      }
+
+      // RFC-003 cap exceeded：enforce=true 时 charge() 撞 cap 触发，game alloc 失败。
+      // 转给 Dart 做 bsd_js_cap_exceeded 埋点 + 后续可能的 hardKill 决策。
+      if (data.type === 'sekai:js_cap_exceeded') {
+        try {
+          sendFlutterMessage({
+            action: 'jsCapExceeded',
+            data: {
+              cat: data.cat || '',
+              attempted_bytes: data.attempted || 0,
+              used_bytes: data.used || 0,
+              cap_bytes: data.cap || 0,
+              game_id: (GAME && GAME.game_id) || '',
+            },
+          });
+        } catch (_e) {}
+        return;
+      }
+
+      if (data.type === 'sekai_iframe_perf_trace') {
+        // 来自子帧 prelude 的 PerformanceObserver / readystatechange / DOM
+        // 阶段事件，透传到 console，定位 viewport_ready → dom_ready 之间的
+        // 具体瓶颈（外部 CDN、大资源、长 inline script 等）。
+        try {
+          var line = '[ShellPerf] child:' + data.tag + ' childTs=' + Math.round(data.ts || 0) + 'ms gameId=' + (GAME && GAME.game_id || '?');
+          if (data.extra) line += ' ' + JSON.stringify(data.extra);
+          console.log(line);
+        } catch (_e) {}
+        return;
+      }
+
+      if (data.type === 'sekai_iframe_console') {
+        // game iframe (blob:null 跨源) 的 console.* 经 prelude 主动 forward 上来。
+        // 这里再 console.log 一次，让 InAppWebView 的 onConsoleMessage 抓得到。
+        try {
+          var clvl = String(data.level || 'log').toLowerCase();
+          var line = String(data.line || '');
+          var fn = (console[clvl] && typeof console[clvl] === 'function') ? console[clvl] : console.log;
+          fn.call(console, '[GameInside ' + clvl + '] gameId=' + (GAME && GAME.game_id || '?') + ' | ' + line);
+          forwardImportantConsoleLog(clvl, line);
+        } catch (_e) {}
+        return;
+      }
+
+      if (data.type === 'sekai_iframe_js_error') {
+        var jf = iframeNode();
+        if (!jf || event.source !== jf.contentWindow) return;
+        hideLoading();
+        // js_error 同时上报两条：既保留原有的 g3_feed_iframe_js_error 埋点，
+        // 又把累计到 perf session 里（content 行的 js_error_count 字段）。
+        reportPerfEvent('js_error', {
+          message: data.message || '',
+          source: data.source || '',
+          errorName: data.errorName || '',
+          lineno: data.lineno || 0,
+          colno: data.colno || 0,
+        });
+        // 'g3_feed_game_frame' 来源代表 HTML 拉取/iframe 本身失败，视作 fetch_failed，
+        // 与 v1 onFeedPerfFetchFailed 对齐。通知 Flutter loading 结束。
+        if (data.source === 'g3_feed_game_frame') {
+          clearDomReadyTimeout();
+          reportPerfEvent('fetch_failed', null);
+          var reason = data.errorName || data.message || 'game_frame_error';
+          reportIframeLoadState('error', reason, { message: data.message || '', errorName: data.errorName || '' });
+        }
+        sendFlutterMessage({
+          action: 'logEvent',
+          parameters: {
+            eventName: 'g3_feed_iframe_js_error',
+            offline: true,
+            web: true,
+            gameId: GAME.game_id || '',
+            message: data.message || '',
+            source: data.source || '',
+            errorName: data.errorName || '',
+            container: 'newFeed',
+          },
+        });
+        return;
+      }
+
+      // Feed perf 资源汇总（iframe 内 PerformanceObserver 注入脚本发出）。
+      if (data.type === 'sekai_iframe_perf_resources') {
+        reportPerfEvent('resources', data.payload || null);
+        return;
+      }
+
+      if (data.type === 'sekai_iframe_perf_resource_details') {
+        reportPerfEvent('resource_details', data.payload || null);
+        return;
+      }
+
+      if (data.type === 'sekai:mini_app_interacted') {
+        var interactionFrame = iframeNode();
+        if (!interactionFrame || event.source !== interactionFrame.contentWindow) return;
+        notifyNativeFeedMiniAppInteracted();
+        return;
+      }
+
+      // Feed perf 真实可闻性边沿（iframe 内 media audibility observer 发出）。
+      if (data.type === 'sekai_iframe_audio_playing_started') {
+        reportPerfEvent('audio_started', {
+          event_ts_ms: typeof data.timestamp === 'number' ? data.timestamp : Date.now(),
+        });
+        return;
+      }
+      if (data.type === 'sekai_iframe_audio_playing_stopped') {
+        reportPerfEvent('audio_stopped', {
+          event_ts_ms: typeof data.timestamp === 'number' ? data.timestamp : Date.now(),
+        });
+        return;
+      }
+
+      // Motion-on-demand：游戏注册/注销 devicemotion/orientation 监听时，
+      // content-frame → game_frame → shell 接到此消息，转发给 Flutter 按需
+      // 启停 60Hz motion bridge（sensors_plus + evaluateJavascript）。
+      if (data.type === 'sekai:motion-needed') {
+        sendFlutterMessage({
+          action: 'motionNeeded',
+          data: { needed: !!data.needed }
+        });
+        return;
+      }
+
+      if (data.origin !== 'sekai_gaming_iframe_api') return;
+      var iframe = iframeNode();
+
+      function reply(taskId, type, payload, errCode, errMsg) {
+        if (!iframe || !iframe.contentWindow) return;
+        var msg = {
+          origin: 'sekai_gaming_iframe_api',
+          type: type,
+          taskId: taskId,
+        };
+        if (errCode) {
+          msg.data = null;
+          msg.error = { code: errCode, message: errMsg || 'Error' };
+        } else {
+          msg.data = payload !== undefined ? payload : null;
+        }
+        iframe.contentWindow.postMessage(msg, '*');
+      }
+
+      switch (data.type) {
+        case 'sekai_iframe_dom_ready':
+          if (!iframe || event.source !== iframe.contentWindow) return;
+          _iframeLoaded = true;
+          console.log('[NativeFeedShell] iframeDomReady gameId=' + (GAME.game_id || ''));
+          shellPerf('iframe_dom_ready', null);
+          clearDomReadyTimeout();
+          hideLoading();
+          reportIframeLoadState('complete');
+          // dom_ready 用于 content 行 status='success' 收口，与 html_ready 一起算 visible_to_dom_ready_ms。
+          reportPerfEvent('dom_ready', null);
+          reportFirstIframeLoadSuccess();
+          syncAudioStateForce('iframe_dom_ready');
+          sendViewportHeight();
+          // 预加载（不可见）时刚加载完的游戏要立刻冻结：之前的 freeze 发给的是
+          // 旧内容，游戏 prelude 此刻才就绪，需重发一次 sekai:freeze 暂停 rAF。
+          // 可见卡则发 thaw（已在跑，幂等无害）。
+          applyIframeVisibility();
+          break;
+
+        // Fallback: game_frame relays this when its inner iframe fires window.load.
+        // Catches CDN-heavy games where DOMContentLoaded is delayed beyond the fast-path
+        // postMessage but the full load eventually completes.
+        case 'sekai_iframe_load_fallback':
+          if (!_iframeLoaded) {
+            _iframeLoaded = true;
+            console.log('[NativeFeedShell] iframeLoadFallback gameId=' + (GAME.game_id || ''));
+            shellPerf('iframe_load_fallback', null);
+            clearDomReadyTimeout();
+            hideLoading();
+            reportIframeLoadState('complete');
+            reportPerfEvent('dom_ready', null);
+            reportFirstIframeLoadSuccess();
+            syncAudioStateForce('iframe_load_fallback');
+            sendViewportHeight();
+            // 同 dom_ready：预加载完成后若不可见则立刻冻结。
+            applyIframeVisibility();
+          }
+          break;
+
+        case 'get_app_states':
+        case 'get_game_states': {
+          var statesRsp = data.type === 'get_game_states' ? 'receive_game_states' : 'receive_app_states';
+          var statesSessionCode = data.sessionCode;
+          var statesParams = { gameId: GAME.game_id, versionId: GAME.version_id };
+          if (statesSessionCode) statesParams.sessionCode = statesSessionCode;
+          callApiGet('/game/game-states', statesParams)
+            .then(function (r) {
+              if (r.status === 404) { reply(data.taskId, statesRsp, null, 400, 'No saved state found'); return null; }
+              return r.json();
+            })
+            .then(function (result) {
+              if (!result) return;
+              var states = extractData(result);
+              if (!states) { reply(data.taskId, statesRsp, null, 400, 'No saved state found'); return; }
+              var msg = { origin: 'sekai_gaming_iframe_api', type: statesRsp, taskId: data.taskId, data: states };
+              if (statesSessionCode) msg.sessionCode = statesSessionCode;
+              if (iframe && iframe.contentWindow) iframe.contentWindow.postMessage(msg, '*');
+            })
+            .catch(function () { reply(data.taskId, statesRsp, null, 500, 'Failed to load app states'); });
+          break;
+        }
+
+        case 'save_app_states':
+        case 'save_game_states': {
+          var saveStatesData = data.data;
+          if (!saveStatesData || typeof saveStatesData !== 'object') break;
+          var saveStatesBody = {
+            pageSettings: saveStatesData.pageSettings,
+            gameId: GAME.game_id,
+            versionId: GAME.version_id,
+          };
+          callApi('/game/game-states', saveStatesBody).catch(function () { });
+          break;
+        }
+
+        case 'get_app_result':
+        case 'get_game_result': {
+          var resultRsp = data.type === 'get_game_result' ? 'receive_game_result' : 'receive_app_result';
+          callApiGet('/game/result', { gameId: GAME.game_id, versionId: GAME.version_id })
+            .then(function (r) { return r.json(); })
+            .then(function (result) { reply(data.taskId, resultRsp, extractData(result)); })
+            .catch(function () { reply(data.taskId, resultRsp, null, 500, 'Failed to get app result'); });
+          break;
+        }
+
+        case 'save_app_result':
+        case 'save_game_result': {
+          var saveResultBody = Object.assign({ gameId: GAME.game_id, versionId: GAME.version_id }, data.data || {});
+          callApi('/game/result', saveResultBody).catch(function () { });
+          break;
+        }
+
+        case 'get_app_top_results':
+        case 'get_game_top_results': {
+          var topRsp = data.type === 'get_game_top_results' ? 'receive_game_top_results' : 'receive_app_top_results';
+          var topPage = (data.data && data.data.page) ? Math.max(1, data.data.page) : 1;
+          var topPageSize = Math.min(100, Math.max(1, (data.data && data.data.pageSize) ? data.data.pageSize : 50));
+          callApiGet('/game/top-results', {
+            gameId: GAME.game_id,
+            versionId: GAME.version_id,
+            page: topPage,
+            page_size: topPageSize,
+          })
+            .then(function (r) { return r.json(); })
+            .then(function (result) {
+              var payload = extractData(result);
+              var items = (payload && payload.items) ? payload.items : (Array.isArray(payload) ? payload : []);
+              items.items = items;
+              reply(data.taskId, topRsp, items);
+            })
+            .catch(function () { reply(data.taskId, topRsp, []); });
+          break;
+        }
+
+        case 'call_llm':
+        case 'gen_text': {
+          var genTextRsp = data.type === 'call_llm' ? 'receive_call_llm' : 'receive_gen_text';
+          var gtd = data.data || {};
+          if (!gtd.systemPrompt || !gtd.userPrompt) {
+            reply(data.taskId, genTextRsp, null, 400, 'Missing systemPrompt or userPrompt');
+            break;
+          }
+          var schema = gtd.responseSchema;
+          if (!schema || typeof schema !== 'object' || !Object.keys(schema).length) {
+            reply(data.taskId, genTextRsp, null, 400, 'Invalid response schema');
+            break;
+          }
+          var genTextBody = {
+            messages: [
+              { role: 'system', content: gtd.systemPrompt },
+              { role: 'user', content: gtd.userPrompt },
+            ],
+            responseSchema: schema,
+            gameId: GAME.game_id,
+            versionId: GAME.version_id,
+          };
+          if (gtd.imageUrl) genTextBody.imageUrl = gtd.imageUrl;
+          callApi('/game/gen-text', genTextBody)
+            .then(function (r) { return r.json(); })
+            .then(function (result) { reply(data.taskId, genTextRsp, extractData(result)); })
+            .catch(function (err) { reply(data.taskId, genTextRsp, null, 500, (err && err.message) || 'LLM API call failed'); });
+          break;
+        }
+
+        case 'gen_image': {
+          var gid = data.data || {};
+          if (!gid.prompt || typeof gid.prompt !== 'string') {
+            reply(data.taskId, 'receive_gen_image', null, 400, 'Missing or invalid prompt');
+            break;
+          }
+          var genImageBody = { userPrompt: gid.prompt, gameId: GAME.game_id, versionId: GAME.version_id };
+          if (gid.imageUrl) genImageBody.imageUrl = gid.imageUrl;
+          if (gid.aspectRatio) genImageBody.aspectRatio = gid.aspectRatio;
+          if (gid.cutout !== undefined) genImageBody.cutout = gid.cutout;
+          callApi('/game/gen-image', genImageBody)
+            .then(function (r) { return r.json(); })
+            .then(function (result) { reply(data.taskId, 'receive_gen_image', extractData(result)); })
+            .catch(function (err) {
+              var code = (err && err.status) || 500;
+              reply(
+                data.taskId,
+                'receive_gen_image',
+                null,
+                code,
+                code === 429 ? 'Daily image generation limit reached' : 'Image generation failed'
+              );
+            });
+          break;
+        }
+
+        case 'gen_voice': {
+          var gvd = data.data || {};
+          if (!gvd.text || !gvd.voiceId) {
+            reply(data.taskId, 'receive_gen_voice', null, 400, 'Missing text or voiceId');
+            break;
+          }
+          callApiBlob('/audio/gen-audio', { text: gvd.text, voiceId: String(gvd.voiceId) })
+            .then(function (blob) {
+              return new Promise(function (resolve, reject) {
+                var reader = new FileReader();
+                reader.onloadend = function () { resolve(reader.result); };
+                reader.onerror = reject;
+                reader.readAsDataURL(blob);
+              });
+            })
+            .then(function (audioBase64) { reply(data.taskId, 'receive_gen_voice', { audioBase64: audioBase64 }); })
+            .catch(function () { reply(data.taskId, 'receive_gen_voice', null, 500, 'Voice generation failed'); });
+          break;
+        }
+
+        case 'gen_transcript': {
+          var gtrData = data.data || {};
+          var audio = gtrData.audio;
+          if (!audio || typeof audio !== 'string' || audio.indexOf('data:audio/') !== 0) {
+            reply(data.taskId, 'receive_gen_transcript', null, 400, 'Missing or invalid audio data');
+            break;
+          }
+          uploadBase64ToS3(audio, 'audio')
+            .then(function (hostUrl) {
+              return callApi('/game/gen-transcript', {
+                audioUrl: hostUrl,
+                initialPrompt: gtrData.initialPrompt || '',
+              });
+            })
+            .then(function (r) { return r.json(); })
+            .then(function (result) { reply(data.taskId, 'receive_gen_transcript', extractData(result)); })
+            .catch(function () { reply(data.taskId, 'receive_gen_transcript', null, 500, 'Transcription failed'); });
+          break;
+        }
+
+        case 'get_social_summary': {
+          Promise.all([
+            callApiGet('/game/likers', { game_id: GAME.game_id, page: 1, page_size: 20 }).then(function (r) { return r.json(); }).catch(function () { return null; }),
+            callApiGet('/game/commenters', { game_id: GAME.game_id, page: 1, page_size: 20 }).then(function (r) { return r.json(); }).catch(function () { return null; }),
+          ]).then(function (results) {
+            var likers = (results[0] && results[0].data && results[0].data.items) || (results[0] && results[0].items) || [];
+            var commenters = (results[1] && results[1].data && results[1].data.items) || (results[1] && results[1].items) || [];
+            reply(data.taskId, 'receive_social_summary', {
+              likes: _likeCount,
+              comments: _commentCount,
+              isLiked: _isLiked,
+              likers: likers,
+              commenters: commenters,
+            });
+          });
+          break;
+        }
+
+        case 'get_player_info': {
+          if (!_authToken || _isTourist || !_userId) { reply(data.taskId, 'receive_player_info', null); break; }
+          callApiGet('/user/v2/getUserInfo', { userId: _userId })
+            .then(function (r) { return r.json(); })
+            .then(function (result) {
+              var user = result && result.data && result.data.user;
+              if (!user) { reply(data.taskId, 'receive_player_info', null); return; }
+              reply(data.taskId, 'receive_player_info', {
+                userId: String(user.userId),
+                username: user.userName,
+                avatar: user.avatarUrl,
+                countryCode: user.countryCode || 'US',
+                isCreator: !!(user.userId && String(user.userId) === String(GAME.creator_user_id)),
+              });
+            })
+            .catch(function () { reply(data.taskId, 'receive_player_info', null); });
+          break;
+        }
+
+        case 'invoke_select_characters':
+          reply(data.taskId, 'receive_select_characters', null, 400, 'Character selection not supported');
+          break;
+
+        case 'invoke_share': {
+          var shareData = data.data || {};
+          var shareLink = buildShareLink();
+          if (shareData.appStates) {
+            try { shareLink += '&appStates=' + encodeURIComponent(btoa(JSON.stringify(shareData.appStates))); } catch (_e) { }
+          }
+          var payloadGameType = shareData.multiplayerShare ? 'multiplayer' : (GAME.type || GAME.game_type || '');
+          var payloadCreatorName = GAME.creator_name || GAME.creatorUsername || '';
+          var payloadCreateName = buildSharePanelCreateName(payloadGameType, payloadCreatorName);
+          var payload = {
+            title: buildSharePanelTitle(payloadGameType, shareData.title || 'Share to'),
+            bottomTitle: GAME.title || '',
+            contentType: 'g3_game',
+            contentId: GAME.game_id,
+            fromPage: 'feed',
+            link: shareLink,
+            needWatermark: false,
+            type: 'share_only',
+            gameType: payloadGameType,
+            extra: {
+              creatorId: GAME.creator_user_id,
+              creatorName: payloadCreatorName,
+              creatorAvatarUrl: GAME.creator_avatar || GAME.creatorAvatar || '',
+              title: GAME.title || '',
+              shareContent: buildShareContent(),
+            },
+          };
+          if (payloadCreateName) {
+            payload.extra.createName = payloadCreateName;
+          }
+          if (shareData.multiplayerShare) {
+            payload.multiplayerShare = shareData.multiplayerShare;
+          }
+          if (shareData.coverImageBase64) {
+            payload.imageB64 = shareData.coverImageBase64;
+          } else if (
+            shareData.coverImgUrl &&
+            typeof shareData.coverImgUrl === 'string' &&
+            shareData.coverImgUrl.indexOf('sekai-local://') === 0
+          ) {
+            var cacheKey = shareData.coverImgUrl.replace('sekai-local://', '');
+            payload.imageB64 = _uploadCache[cacheKey] || null;
+            if (!payload.imageB64) payload.imageUrl = GAME.cover;
+          } else {
+            payload.imageUrl = shareData.coverImgUrl || GAME.cover;
+          }
+          payload.other_actions = [
+            { name: 'Full Screen', icon: 'https://public-access.sekai.chat/icon/universe/icon_share_fullscreen2.png', action: 'g3FullScreen' },
+            { name: 'Download', icon: 'https://public-access.sekai.chat/icon/universe/icon_share_download2.png', action: 'g3Download' },
+            { name: 'Feedback', icon: 'https://public-access.sekai.chat/icon/universe/icon_share_feedback2.png', action: 'g3Feedback' },
+          ];
+          sendFlutterMessage({ action: 'showSharePanel', arguments: payload });
+          break;
+        }
+
+        case 'invoke_social': {
+          var socialData = data.data || {};
+          var action = socialData.action;
+          if (!action) {
+            reply(data.taskId, 'receive_social_action_result', { action: action, success: false });
+            break;
+          }
+          if (action === 'like' || action === 'unlike') {
+            _isLiked = action === 'like';
+            _likeCount += _isLiked ? 1 : -1;
+            callApi(_isLiked ? '/user/v2/like' : '/user/v2/unlike', {
+              elementType: 'game_3',
+              elementId: GAME.game_id,
+            })
+              .then(function () {
+                reply(data.taskId, 'receive_social_action_result', {
+                  action: action,
+                  success: true,
+                  isLiked: _isLiked,
+                  likeCount: _likeCount,
+                });
+              })
+              .catch(function () {
+                _isLiked = !_isLiked;
+                _likeCount += _isLiked ? 1 : -1;
+                reply(data.taskId, 'receive_social_action_result', { action: action, success: false });
+              });
+            break;
+          }
+          if (action === 'comment') {
+            var _giComment = buildGameInfoForCommentPanel();
+            sendFlutterMessage({
+              action: 'showCommentPanel',
+              arguments: {
+                type: 'game_3',
+                id: GAME.game_id,
+                commentCount: _commentCount,
+                fromPage: 'feed',
+                showShot: true,
+                sekaiCreatorId: _giComment.creator_id,
+                game: _giComment,
+              },
+            });
+            reply(data.taskId, 'receive_social_action_result', { action: 'comment', success: true, commentCount: _commentCount });
+            break;
+          }
+          if (action === 'remix') {
+            var _giRemix = buildGameInfoForCommentPanel();
+            sendFlutterMessage({
+              action: 'showCommentPanel',
+              arguments: {
+                type: 'game_3',
+                id: GAME.game_id,
+                commentCount: _commentCount,
+                fromPage: 'feed',
+                showShot: true,
+                remixId: GAME.game_id,
+                tabIndex: 1,
+                sekaiCreatorId: _giRemix.creator_id,
+                game: _giRemix,
+              },
+            });
+            reply(data.taskId, 'receive_social_action_result', { action: 'remix', success: true, commentCount: _commentCount });
+            break;
+          }
+          reply(data.taskId, 'receive_social_action_result', null, 400, 'Unknown action: ' + action);
+          break;
+        }
+
+        case 'create_app_private_session':
+          mpHandleCreateAppPrivateSession(data.taskId, data.data);
+          break;
+        case 'get_app_private_sessions':
+          mpHandleGetAppPrivateSessions(data.taskId);
+          break;
+        case 'join_app_private_session':
+          mpHandleJoinAppPrivateSession(data.taskId, data.data);
+          break;
+        case 'multiplayer_get_session':
+          mpHandleGetSession(data.taskId);
+          break;
+        case 'multiplayer_get_players':
+          mpHandleGetPlayers(data.taskId);
+          break;
+        case 'multiplayer_send_data':
+          mpHandleSendData(data.data);
+          break;
+
+        case 'deeplink_click': {
+          var deeplinkData = data.data || {};
+          sendFlutterMessage({
+            action: 'logEvent',
+            parameters: {
+              eventName: 'deeplink_click',
+              source: deeplinkData.source || 'native_feed',
+              contentId: deeplinkData.contentId || deeplinkData.content_id || GAME.game_id || '',
+              content_id: deeplinkData.content_id || deeplinkData.contentId || GAME.game_id || '',
+              contentType: 'g3_game',
+              fromPage: deeplinkData.fromPage || 'feed',
+              is_multiplayer: deeplinkData.is_multiplayer == null ? true : deeplinkData.is_multiplayer,
+              inviter_id: deeplinkData.inviter_id || deeplinkData.inviterId || '',
+            },
+          });
+          break;
+        }
+
+        case 'gen_vibration':
+          requestShellVibration(data.data);
+          break;
+        case 'upload_image': {
+          var image = data.data && data.data.image;
+          if (!image || typeof image !== 'string' || image.indexOf('data:image/') !== 0) {
+            reply(
+              data.taskId,
+              'receive_upload_image',
+              null,
+              400,
+              'Image must include data URL prefix (e.g., data:image/png;base64,...)'
+            );
+            break;
+          }
+          uploadBase64ToS3(image, 'image')
+            .then(function (hostUrl) {
+              reply(data.taskId, 'receive_upload_image', { hostUrl: hostUrl });
+            })
+            .catch(function (err) {
+              reply(
+                data.taskId,
+                'receive_upload_image',
+                null,
+                500,
+                (err && err.message) || 'Image upload failed'
+              );
+            });
+          break;
+        }
+      }
+    });
+
+    function tryPageReady() {
+      var hasFlutterHandler = typeof window.sendMessageToFlutter === 'function' ||
+        (window.flutter_inappwebview && window.flutter_inappwebview.callHandler);
+      if (!hasFlutterHandler) {
+        _pageReadyRetries += 1;
+        if (_pageReadyRetries < 20) setTimeout(tryPageReady, 300);
+        return;
+      }
+      sendFlutterMessage({ action: 'pageReady', data: { creatorUserId: GAME.creator_user_id } });
+    }
+
+    document.addEventListener('visibilitychange', function () {
+      if (document.visibilityState === 'hidden') {
+        stopVibration();
+      } else if (_isCardVisible) {
+        resumeVibration();
+      }
+      syncAudioState('document_visibility_change');
+    });
+    window.addEventListener('resize', sendViewportHeight);
+
+    (function init() {
+      var iframe = iframeNode();
+      if (!iframe) return;
+      iframe.addEventListener('load', function () {
+        if (!_iframeActive || !iframe.contentWindow) return;
+        postBootstrapToFrame();
+        syncAudioStateForce('iframe_load');
+        sendViewportHeight();
+      });
+      tryPageReady();
+    })();
+  </script>
+</body>
+
+</html>
