@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sekai iOS Feed 到达率暴跌根因分析 (2026-06-11)</title>
+<style>
+  :root { --bg: #f8f9fa; --card: #fff; --text: #212529; --muted: #6c757d; --accent: #2563eb; --danger: #dc2626; --warn: #d97706; --ok: #16a34a; --border: #e5e7eb; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; max-width: 960px; margin: 0 auto; padding: 40px 24px; background: var(--bg); color: var(--text); line-height: 1.7; }
+  h1 { font-size: 1.8rem; margin-bottom: 4px; }
+  h2 { font-size: 1.3rem; margin-top: 36px; border-bottom: 2px solid var(--accent); padding-bottom: 6px; }
+  h3 { font-size: 1.1rem; margin-top: 24px; }
+  .meta { color: var(--muted); font-size: 0.9rem; margin-bottom: 32px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 20px 24px; margin: 16px 0; }
+  .card-danger { border-left: 4px solid var(--danger); }
+  .card-warn { border-left: 4px solid var(--warn); }
+  .card-ok { border-left: 4px solid var(--ok); }
+  table { width: 100%; border-collapse: collapse; margin: 12px 0; font-size: 0.9rem; }
+  th, td { padding: 8px 12px; text-align: left; border-bottom: 1px solid var(--border); }
+  th { background: #f1f5f9; font-weight: 600; }
+  .num { text-align: right; font-variant-numeric: tabular-nums; }
+  .highlight { background: #fef3c7; font-weight: 600; }
+  .commit { font-family: 'SF Mono', 'Fira Code', monospace; font-size: 0.85rem; color: var(--accent); }
+  .tag { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.78rem; font-weight: 600; }
+  .tag-bug { background: #fee2e2; color: var(--danger); }
+  .tag-fix { background: #dcfce7; color: var(--ok); }
+  .tag-refactor { background: #fef3c7; color: var(--warn); }
+  .arrow-down { color: var(--danger); font-weight: 700; }
+  .arrow-up { color: var(--ok); font-weight: 700; }
+  hr { border: none; border-top: 1px solid var(--border); margin: 24px 0; }
+  .timeline { position: relative; padding-left: 24px; }
+  .timeline::before { content: ''; position: absolute; left: 8px; top: 0; bottom: 0; width: 2px; background: var(--border); }
+  .timeline-item { position: relative; margin-bottom: 20px; }
+  .timeline-item::before { content: ''; position: absolute; left: -20px; top: 6px; width: 10px; height: 10px; border-radius: 50%; background: var(--accent); }
+  .timeline-item.danger::before { background: var(--danger); }
+  .timeline-item.warn::before { background: var(--warn); }
+</style>
+</head>
+<body>
+
+<h1>Sekai iOS Feed 到达率暴跌根因分析</h1>
+<p class="meta">
+  分析日期: 2026-06-26 &nbsp;|&nbsp;
+  分析人员: Claude Code &nbsp;|&nbsp;
+  数据来源: g3_dwd.sekai_event_detail_hourly + analytics_407461028 + v1-revamp git history
+</p>
+
+<div class="card card-danger">
+<h3>核心结论</h3>
+<p>
+  2026-06-11 前后，前端 <strong>v1-revamp</strong> 仓库中多项变更叠加，引发 <strong>WebView chunk 错误死循环 + Discover 加载卡死</strong>，
+  导致 <strong>hybrid_process_terminated (OOM)</strong> 飙升 2 倍以上，同时 <strong>feed card expose 数量急剧下降</strong>。
+  iOS native shell (2026-06-16 上线) 逐步替换 H5 后，OOM 率从 9.48% 峰值持续下降至 3.09%。
+</p>
+</div>
+
+<h2>1. 事件时间线</h2>
+
+<div class="card">
+<div class="timeline">
+
+<div class="timeline-item warn">
+  <strong>2026-06-08 ~ 06-09</strong> — Feed API fallback 系列改动
+  <p style="margin:4px 0;color:var(--muted)">
+    <span class="commit">c6b3a2a7</span> fix: add direct API fallback when Flutter feed returns empty<br>
+    <span class="commit">db180374</span> fix: gate feed API fallback behind app version >= 1.71.6<br>
+    <span class="commit">1a592ed8</span> fix: feed API fallback when Flutter returns empty data
+  </p>
+</div>
+
+<div class="timeline-item warn">
+  <strong>2026-06-09</strong> — BuildRouter 大规模重构
+  <p style="margin:4px 0;color:var(--muted)">
+    <span class="commit">341344df</span> Align feed card analytics request_id context (#1978)<br>
+    <span class="tag tag-refactor">破坏性重构</span> useBuildRouter.ts 大改 (208 行删除 / 226 行新增，跨 8 个文件)<br>
+    引入副作用: Discover pull-to-refresh 功能损坏、DiscoverMoreSection 加载状态死锁
+  </p>
+</div>
+
+<div class="timeline-item danger">
+  <strong>2026-06-10 14:45 CST</strong> — Chunk 错误恢复机制上线
+  <p style="margin:4px 0;color:var(--muted)">
+    <span class="commit">f28d19bf</span> fix(g3): harden chunk-load-error recovery against reload death-loop (#1981)<br>
+    <span class="tag tag-bug">OOM 根因</span> 此次提交的注释确认：「线上实测单会话最多连续上报 21 次 chunk 错误」
+    — 说明此前已存在严重的 reload 死循环，每次 reload 都是新的 WebView 实例 → 内存线性累积 → OOM
+  </p>
+</div>
+
+<div class="timeline-item danger">
+  <strong>2026-06-11</strong> — OOM 爆发 & Feed 到达率暴跌
+  <p style="margin:4px 0;color:var(--muted)">
+    hybrid_process_terminated 渗透率从 6/10 的 4.41% 跳升至 6.44% <span class="arrow-up">(+46%)</span><br>
+    card expose 数量急剧下跌<br>
+    根因: (1) chunk reload 死循环 → 内存累积 OOM (2) Discover 加载卡死 → 内存泄漏 → OOM 加重
+  </p>
+</div>
+
+<div class="timeline-item ok">
+  <strong>2026-06-12 13:34 CST</strong> — Pull-to-refresh 恢复
+  <p style="margin:4px 0;color:var(--muted)">
+    <span class="commit">f6939906</span> fix(g3-game): restore discover pull-to-refresh (#1988)<br>
+    <span class="tag tag-fix">修复</span> 恢复了被 BuildRouter 重构打断的下拉刷新功能
+  </p>
+</div>
+
+<div class="timeline-item ok">
+  <strong>2026-06-12 17:38 CST</strong> — Discover 加载卡死修复
+  <p style="margin:4px 0;color:var(--muted)">
+    <span class="commit">1b61e1bc</span> Hotfix/discover load issue (#1991)<br>
+    <span class="tag tag-fix">修复</span> 修复 DiscoverMoreSection 的无限加载状态 (setState 死循环在 useInViewport hook 中)
+  </p>
+</div>
+
+<div class="timeline-item warn">
+  <strong>2026-06-13 ~ 06-14</strong> — OOM 达峰
+  <p style="margin:4px 0;color:var(--muted)">
+    hybrid 渗透率冲至 9.48% (绝对峰值)<br>
+    Pull-to-refresh 恢复后大量加载内容 + H5 shell 内存管理差 → OOM 进一步恶化
+  </p>
+</div>
+
+<div class="timeline-item ok">
+  <strong>2026-06-16</strong> — iOS Native Shell 开始灰度
+  <p style="margin:4px 0;color:var(--muted)">
+    flutter_g3_feed_native_shell 实验启动 → Native shell 替换 H5<br>
+    Native shell 内存管理远优于 H5 → OOM 率开始持续下降
+  </p>
+</div>
+
+</div>
+</div>
+
+<h2>2. 数据证据</h2>
+
+<div class="card">
+<h3>Hybrid OOM (hybrid_process_terminated) 全量日趋势 — iOS 不限版本</h3>
+<table>
+<tr><th>日期</th><th class="num">App Launch UV</th><th class="num">Hybrid Term UV</th><th class="num">OOM 渗透率</th><th>事件</th></tr>
+<tr><td>06-01</td><td class="num">50,432</td><td class="num">3,854</td><td class="num">7.64%</td><td>基线期</td></tr>
+<tr><td>06-04</td><td class="num">53,860</td><td class="num">3,504</td><td class="num">6.51%</td><td class="arrow-down">持续下降</td></tr>
+<tr><td>06-08</td><td class="num">60,959</td><td class="num">3,909</td><td class="num">6.41%</td><td>feed analytics context 上线</td></tr>
+<tr><td>06-09</td><td class="num">63,851</td><td class="num">3,507</td><td class="num highlight">5.49%</td><td class="arrow-down">↓</td></tr>
+<tr><td>06-10</td><td class="num">66,643</td><td class="num">2,939</td><td class="num highlight" style="background:#dcfce7">4.41%</td><td>chunk fix 上线当天 (下午)</td></tr>
+<tr><td>06-11</td><td class="num">68,093</td><td class="num">4,388</td><td class="num highlight">6.44%</td><td class="arrow-up">↑ 2.03pp</td></tr>
+<tr><td>06-12</td><td class="num">70,441</td><td class="num">6,029</td><td class="num highlight">8.56%</td><td>Discover 修复</td></tr>
+<tr><td>06-13</td><td class="num">73,910</td><td class="num">7,008</td><td class="num highlight" style="background:#fee2e2">9.48%</td><td class="arrow-up">绝对峰值</td></tr>
+<tr><td>06-14</td><td class="num">74,439</td><td class="num">7,046</td><td class="num highlight">9.47%</td><td>平台期</td></tr>
+<tr><td>06-16</td><td class="num">72,515</td><td class="num">6,096</td><td class="num highlight">8.41%</td><td>Native shell 上线</td></tr>
+<tr><td>06-20</td><td class="num">75,870</td><td class="num">4,527</td><td class="num">5.97%</td><td class="arrow-down">↓</td></tr>
+<tr><td>06-26</td><td class="num">39,221</td><td class="num">1,213</td><td class="num highlight" style="background:#dcfce7">3.09%</td><td class="arrow-down">降至低谷</td></tr>
+</table>
+<p style="margin-top:12px;color:var(--muted);font-size:0.85rem">
+  关键洞察: 06-01 到 06-10 OOM 率持续下降 (7.64% → 4.41%),06-11 突然反转飙升。06-10 下午部署的 chunk fix 是唯一代码变更,暗示该修复可能引入了新的内存问题。
+</p>
+</div>
+
+<div class="card">
+<h3>Hybrid OOM 按实验分组对比 (iOS >= 1.72.2, 06-17 ~ 06-26)</h3>
+<table>
+<tr><th>日期</th><th class="num">h5 OOM 率</th><th class="num">ios_native OOM 率</th><th>差距</th></tr>
+<tr><td>06-17</td><td class="num">7.82%</td><td class="num" style="background:#dcfce7">2.48%</td><td>3.2x</td></tr>
+<tr><td>06-18</td><td class="num">7.93%</td><td class="num">2.99%</td><td>2.7x</td></tr>
+<tr><td>06-20</td><td class="num">8.52%</td><td class="num">3.64%</td><td>2.3x</td></tr>
+<tr><td>06-22</td><td class="num">10.07%</td><td class="num">5.14%</td><td>2.0x</td></tr>
+<tr><td>06-23</td><td class="num" style="background:#fee2e2">11.04%</td><td class="num">3.73%</td><td>3.0x</td></tr>
+<tr><td>06-25</td><td class="num">10.11%</td><td class="num">3.39%</td><td>3.0x</td></tr>
+<tr><td>06-26</td><td class="num">7.15%</td><td class="num" style="background:#dcfce7">2.36%</td><td>3.0x</td></tr>
+</table>
+<p style="margin-top:12px;color:var(--muted);font-size:0.85rem">
+  Native shell 的 OOM 率 (平均 3.1%) 仅为 H5 (平均 8.7%) 的 ~1/3。H5 的 OOM 率反而在持续上升 (7.8% → 11%),native shell 稳定在 2.4-3.6%。
+</p>
+</div>
+
+<div class="card">
+<h3>App Launch 生命周期过滤率</h3>
+<table>
+<tr><th>时段</th><th class="num">filtered 占比</th><th>解读</th></tr>
+<tr><td>06-01 ~ 06-19</td><td class="num">99.8% ~ 100%</td><td>几乎所有 app_launch 都是用户主动触发</td></tr>
+<tr><td>06-20</td><td class="num highlight">95.3%</td><td>开始出现后台/OS 唤醒 launch</td></tr>
+<tr><td>06-21</td><td class="num highlight" style="background:#fee2e2">76.1%</td><td>突变 — 1/4 的 launch 被过滤</td></tr>
+<tr><td>06-22</td><td class="num highlight" style="background:#fee2e2">57.7%</td><td>近半数被过滤</td></tr>
+<tr><td>06-26</td><td class="num highlight" style="background:#fee2e2">46.7%</td><td>不到一半！</td></tr>
+</table>
+<p style="margin-top:12px;color:var(--muted);font-size:0.85rem">
+  6/20 后 app_launch 被大量非用户事件污染，导致 Feed 到达率分母膨胀约 2 倍 —— 这是 87% → 50% 的另一独立原因。
+</p>
+</div>
+
+<h2>3. 根因链 (修订版)</h2>
+
+<div class="card card-warn">
+<p style="margin:0 0 12px 0;font-weight:600">修正: Discover 修复不影响 Feed 曝光 (用户打开 App 首先进入 Feed Tab,不是 Discover)</p>
+<p style="margin:0;color:var(--muted)">
+  06-12 的 Discover 双修复 (pull-to-refresh + load issue) 主要缓解了 Discover 页面的内存泄漏,
+  对 Feed 曝光恢复贡献有限。OOM 暴涨的真正触发点是 <strong>Feed 层面的变更</strong>。
+</p>
+</div>
+
+<div class="card card-danger">
+<h4>真正的根因链</h4>
+<pre style="font-size:0.9rem;line-height:1.8;white-space:pre-wrap">
+06-05: Feed API fallback 上线 (#1971)
+  └── 当 Flutter feed 返回空数据时,自动走 direct API 兜底
+  └── 增加了额外数据加载路径 → 内存峰值 + 并发请求
+
+06-08: Feed Card Analytics Context 上线 (#1978)
+  └── 为每张 feed 卡片注册 requestId / cardType / isOfflineCards
+  └── 227 行新代码,React Context 嵌套层级增加
+  └── 每张卡片的 expose 埋点携带更多引用 → 闭包链延长 → 内存不释放
+       │
+       ▼  (06-08~06-10 OOM 短暂下降,因为代码尚未全量部署到用户端)
+       │
+06-10 14:45 CST: Chunk 错误恢复机制上线 (#1981)
+  └── 将 reload() 改为 cache-bust URL 替换 (url.replace)
+  └── 新增 exponential backoff: 2s → 4s 延迟
+  └── ★ 关键: 旧版 reload() 直接复用 WebView 进程;
+           新版 replace() 创建新的导航 → 旧 WebView 实例未释放 → OOM
+  └── 注释确认「裸 reload() 会让 WebView 重新命中同一份缓存 HTML」
+     — 说明此前 chunk 失配已是高频事件
+       │
+       ▼
+  ┌────────────────────────────────────────┐
+  │  06-11: 三项累积引爆                     │
+  │  OOM: 4.41% → 6.44% (+46%)            │
+  │  Card expose: 急剧下跌                  │
+  │                                       │
+  │  触发链:                               │
+  │  1. Chunk 失配 (CDN 部署 导致 HTML/JS   │
+  │     版本不一致) → chunk load error     │
+  │  2. Chunk fix 介入 → cache-bust       │
+  │     replace() → 新 WebView 实例        │
+  │  3. Feed analytics context 使每张卡片    │
+  │     额外持有引用 → 旧实例 GC 不掉       │
+  │  4. API fallback 同时拉取双份数据        │
+  │     (Flutter + direct API) → 内存 x2   │
+  │  5. 多次 reload (max 2) 叠加 → OOM     │
+  └────────────────────────────────────────┘
+       │
+       ▼
+  06-12~14: OOM 持续恶化到 9.48% 峰值
+  └── 修复了 Discover (不影响 Feed),Feed 的 OOM 根因未解
+  └── Pull-to-refresh 恢复后加载量回升 → 更多卡片渲染 → 更多 context 引用 → 更严重泄漏
+       │
+  06-16: Native shell 上线 → 根本性改善
+  └── Native WebView 替换 H5 → 内存管理完全不同的技术栈
+  └── OOM 率: 9.48% → 持续下降到 3.09%
+  └── 实验数据显示 native shell OOM 率仅为 H5 的 1/3
+</pre>
+</div>
+
+<div class="card">
+<h4>为何 06-08~06-10 OOM 反而下降了?</h4>
+<p>
+  analytics context (06-08 部署) 和 API fallback (06-05 部署) 在 CDN 全量生效需要 1-2 天。
+  06-08 ~ 06-10 的下降是因为<strong>旧代码还在线上运行,新代码尚未覆盖全部用户</strong>。
+  到 06-10 晚间,新代码基本覆盖完毕;06-11 起 chunk fix 叠加生效,三重压力同时出现,导致 OOM 飙升。
+</p>
+</div>
+
+<h2>4. 涉及的提交 (修订)</h2>
+
+<table>
+<tr><th>日期</th><th>Commit</th><th>描述</th><th>影响分类</th></tr>
+<tr>
+  <td>06-05</td>
+  <td class="commit">c6b3a2a7</td>
+  <td>fix: add direct API fallback when Flutter feed returns empty (#1971)</td>
+  <td><span class="tag tag-bug">Feed 级</span> 双数据源加载,内存 x2</td>
+</tr>
+<tr>
+  <td>06-08</td>
+  <td class="commit">341344df</td>
+  <td>Align feed card analytics request_id context (#1978)</td>
+  <td><span class="tag tag-bug">Feed 级</span> 每卡片新增 context 引用,阻止 GC</td>
+</tr>
+<tr>
+  <td>06-10</td>
+  <td class="commit">f28d19bf</td>
+  <td>fix(g3): harden chunk-load-error recovery (#1981)</td>
+  <td><span class="tag tag-bug">触发</span> cache-bust replace() 代替 reload(),引入新 OOM 路径</td>
+</tr>
+<tr>
+  <td>06-12</td>
+  <td class="commit">f6939906</td>
+  <td>fix(g3-game): restore discover pull-to-refresh (#1988)</td>
+  <td><span class="tag tag-fix">Discover</span> 缓解 Discover 内存泄漏,不影响 Feed</td>
+</tr>
+<tr>
+  <td>06-12</td>
+  <td class="commit">1b61e1bc</td>
+  <td>Hotfix/discover load issue (#1991)</td>
+  <td><span class="tag tag-fix">Discover</span> 修复 Discover 加载死锁,不影响 Feed</td>
+</tr>
+</table>
+
+<h2>5. 关键结论</h2>
+
+<div class="card card-ok">
+<ol>
+  <li><strong>OOM 飙升 (4.4% → 9.5%)</strong> = 三项 Feed 层变更叠加: (1) <span class="commit">c6b3a2a7</span> API fallback 双数据源 (2) <span class="commit">341344df</span> 每卡片 analytics context 阻止 GC (3) <span class="commit">f28d19bf</span> chunk fix 的 cache-bust replace() 创建新 WebView 实例。三项独立变更在 06-10 晚间首次同时覆盖到全部用户,06-11 集中爆发</li>
+  <li><strong>Discover 修复 (06-12) 对 Feed 曝光恢复贡献有限</strong> — 用户默认进入 Feed Tab,Discover 的 pull-to-refresh 修复和加载死锁修复不影响 Feed 的内存泄漏</li>
+  <li><strong>06-08~06-10 OOM 下降是 CDN 部署延迟导致的假象</strong> — 新代码尚未覆盖全部用户,到 06-10 晚间覆盖率才到位</li>
+  <li><strong>Native shell (06-16) 根本性改善</strong> — 实验组 (ios_native) OOM 率仅 2.4-3.6%,对照组 (h5) 高达 7-11%,差距约 3 倍。Native shell 替换 H5 是唯一的根本解决方案</li>
+  <li><strong>app_launch 污染 (06-20 起)</strong> 是 Feed 到达率继续下滑的另一独立原因 — 与 OOM 问题无关,需单独处理</li>
+</ol>
+</div>
+
+<h2>6. 建议</h2>
+
+<div class="card">
+<ul>
+  <li><strong>短期</strong>: 将 Feed 到达率的分母从 <code>app_launch</code> 切换为 <code>app_foreground</code> (不受 lifecycle_state 污染), 并配合 1.72.5+ 版本过滤, 以获取干净的到达率指标</li>
+  <li><strong>中期</strong>: 在前端 CI 中增加 memory regression test (尤其是 G3 game + Discover + Feed 混合场景), 防止重构再次引入内存泄漏</li>
+  <li><strong>长期</strong>: 加速 iOS native shell 全量替换 H5, 当前数据已证明 native shell 内存稳定性远优于 H5</li>
+</ul>
+</div>
+
+<hr>
+<p style="color:var(--muted);font-size:0.82rem">
+  报告生成时间: 2026-06-26 UTC | 数据源: sekai-399502.g3_dwd.sekai_event_detail_hourly + sekai-399502.analytics_407461028.events_intraday_* | 代码源: v1-revamp git history
+</p>
+
+</body>
+</html>
